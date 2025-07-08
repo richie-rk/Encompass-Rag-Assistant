@@ -1,0 +1,93 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+.env.development
+.env.production
+
+# FastAPI specific
+main.py
+app/
+app/*
+config/
+config/*
+requirements/
+requirements/*
+tests/
+tests/*
+migrations/
+migrations/*
+
+# Streamlit specific
+.streamlit/
+*.streamlit/
+.streamlit/cache/
+
+# LangChain specific
+.llama_cache/
+.langchain/
+.langchain_cache/
+vector_store/
+index.faiss
+index.pkl
+
+# Ollama specific
+.ollama/
+.ollama_cache/
+models/
+models/*/
+*.ckpt
+*.safetensors
+
+# IDE specific files
+.vscode/
+.idea/
+.pydevproject
+.pyCharm*
+.pytest_cache/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trash-1000
+ehthumbs.db
+Thumbs.db
+
+# Testing
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Documentation
+docs/
+docs/*
