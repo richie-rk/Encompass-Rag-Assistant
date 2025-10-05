@@ -2,51 +2,89 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Dict, Any, Optional
 import uvicorn
 import os
+from dotenv import load_dotenv
 
 from rag_docs.rag_class import APIDocumentationRAG
-from importlib.resources import files
 from rag_docs.utils.logger import logger
+
+# Load env variables
+load_dotenv()
 
 
 class QueryRequest(BaseModel):
     query: str = Field(..., min_length=1, description="The question to ask about the API documentation")
 
 
-class SourceDocument(BaseModel):
-    content: str = Field(..., description="Content of the source document")
+class Context7Source(BaseModel):
+    content: str = Field(..., description="Preview of the source content")
+    url: str = Field(default="", description="URL of the documentation")
+    type: str = Field(default="", description="Type of documentation")
+    full_content: str = Field(..., description="Full content of the source")
 
 
-class QueryResponse(BaseModel):
+class PostmanSource(BaseModel):
+    content: str = Field(..., description="Preview of the endpoint content")
+    endpoint_name: str = Field(default="", description="Name of the endpoint")
+    method: str = Field(default="", description="HTTP method")
+    path: str = Field(default="", description="API path")
+    raw_data: Dict[str, Any] = Field(default_factory=dict, description="Raw endpoint data")
+    full_content: str = Field(..., description="Full content of the source")
+
+
+class CSVSource(BaseModel):
+    content: str = Field(..., description="Preview of the source content")
+    url: str = Field(default="", description="URL from the documentation")
+    title: str = Field(default="", description="Title of the document")
+    type: str = Field(default="", description="Type of documentation")
+    full_content: str = Field(..., description="Full content of the source")
+
+
+class EnhancedQueryResponse(BaseModel):
     answer: str = Field(..., description="The answer to the query")
-    sources: List[SourceDocument] = Field(..., description="Source documents used to generate the answer")
+    context7_sources: List[Context7Source] = Field(default_factory=list, description="Context7 documentation sources")
+    postman_sources: List[PostmanSource] = Field(default_factory=list, description="Postman endpoint sources")
+    csv_sources: List[CSVSource] = Field(default_factory=list, description="CSV documentation sources")
+    total_sources_used: int = Field(default=0, description="Total number of sources used")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    csv_path = str(files("rag_docs.data").joinpath("documentation_data.csv"))
-    postman_path = str(files("rag_docs.data").joinpath("Encompass_Developer_Connect_postman_collection.json"))
-    vector_store_path = "vector_store"
+    """Initialize the RAG system on startup"""
 
-    # Create global RAG system
-    app.state.rag_system = APIDocumentationRAG(csv_path, postman_path)
+    # Check if vector store exists
+    vector_store_path = os.getenv("VECTOR_STORE_PATH", "vector_store")
 
-    # Initialize/load the RAG system
-    if os.path.exists(vector_store_path):
-        logger.info(f"Loading existing vector store from {vector_store_path}...")
-        success = app.state.rag_system.load_vector_store(vector_store_path)
-        if not success:
-            logger.info("Failed to load vector store. Initializing from scratch...")
-            app.state.rag_system.initialize()
-            app.state.rag_system.save_vector_store(vector_store_path)
-    else:
-        logger.info("No existing vector store found. Initializing from scratch...")
-        app.state.rag_system.initialize()
-        app.state.rag_system.save_vector_store(vector_store_path)
+    if not os.path.exists(vector_store_path):
+        logger.error(f"Vector store not found at {vector_store_path}")
+        logger.error("Please run 'python scripts/create_vector_store.py' first to create the vector store")
+        raise RuntimeError(f"Vector store not found at {vector_store_path}")
 
-    logger.info("RAG system initialized and ready to use!")
+    # Get configuration from environment
+    model_name = os.getenv("OLLAMA_MODEL", "deepseek-coder-v2:16b")
+    use_gemini = os.getenv("USE_GEMINI", "false").lower() == "true"
+    gemini_api_key = os.getenv("GEMINI_API_KEY", None)
+
+    # Log configuration
+    logger.info(f"Loading vector store from: {vector_store_path}")
+    logger.info(f"Model configuration: {'Gemini' if use_gemini else f'Ollama ({model_name})'}")
+
+    try:
+        # Initialize the RAG system with new parameters
+        app.state.rag_system = APIDocumentationRAG(
+            vector_store_path=vector_store_path,
+            model_name=model_name,
+            use_gemini=use_gemini,
+            gemini_api_key=gemini_api_key
+        )
+
+        logger.info("RAG system initialized successfully!")
+
+    except Exception as e:
+        logger.error(f"Failed to initialize RAG system: {str(e)}")
+        raise
 
     yield
 
@@ -54,61 +92,89 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="API Documentation Assistant",
-    description="A Retrieval-Augmented Generation (RAG) system for querying API documentation",
-    version="1.0.0",
+    title="Encompass API Documentation Assistant",
+    description="A Retrieval-Augmented Generation (RAG) system for querying Encompass API documentation",
+    version="2.0.0",
     lifespan=lifespan
 )
 
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
 # Dependency to get the RAG system
 def get_rag_system():
+    if not hasattr(app.state, 'rag_system'):
+        raise HTTPException(status_code=500, detail="RAG system not initialized")
     return app.state.rag_system
 
 
-@app.post("/api/query", response_model=QueryResponse, tags=["Query"])
+@app.post("/api/query", response_model=EnhancedQueryResponse, tags=["Query"])
 async def get_answer(request: QueryRequest, rag_system: APIDocumentationRAG = Depends(get_rag_system)):
     """
-    Get an answer to a question about the API documentation.
+    Get an answer to a question about the Encompass API documentation.
 
-    This endpoint uses a Retrieval-Augmented Generation (RAG) system to answer
-    questions about the API documentation. It retrieves relevant information from
-    the documentation and generates a natural language answer.
+    Returns the answer along with categorized source documents from Context7, Postman collections, and CSV docs.
     """
     try:
+        # Query the RAG system
         result = rag_system.query(request.query)
 
-        answer = result["result"]
-        sources = [
-            SourceDocument(content=doc.page_content)
-            for doc in result["source_documents"]
+        # Convert sources to response models
+        context7_sources = [
+            Context7Source(**source) for source in result.get("context7_sources", [])
         ]
 
-        return QueryResponse(answer=answer, sources=sources)
+        postman_sources = [
+            PostmanSource(**source) for source in result.get("postman_sources", [])
+        ]
+
+        csv_sources = [
+            CSVSource(**source) for source in result.get("csv_sources", [])
+        ]
+
+        return EnhancedQueryResponse(
+            answer=result["result"],
+            context7_sources=context7_sources,
+            postman_sources=postman_sources,
+            csv_sources=csv_sources,
+            total_sources_used=len(context7_sources) + len(postman_sources) + len(csv_sources)
+        )
 
     except Exception as e:
-
-        print(f"Error processing query: {str(e)}")
+        logger.error(f"Error processing query: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
 
 
 @app.get("/api/health", tags=["Health"])
 async def health_check():
-    """
-    Check if the API is running.
+    """Check if the API is running and RAG system is loaded"""
 
-    Returns a simple message indicating that the API is running.
-    """
-    return {"status": "healthy", "message": "API Documentation Assistant is running"}
+    has_rag = hasattr(app.state, 'rag_system') and app.state.rag_system is not None
+
+    return {
+        "status": "healthy" if has_rag else "degraded",
+        "message": "API Documentation Assistant is running",
+        "rag_system_loaded": has_rag
+    }
+
+
+@app.get("/api/config", tags=["Configuration"])
+async def get_config():
+    """Get current configuration (non-sensitive)"""
+
+    return {
+        "vector_store_path": os.getenv("VECTOR_STORE_PATH", "vector_store"),
+        "model_type": "Gemini" if os.getenv("USE_GEMINI", "false").lower() == "true" else "Ollama",
+        "ollama_model": os.getenv("OLLAMA_MODEL", "deepseek-coder-v2:16b"),
+        "temperature": float(os.getenv("TEMPERATURE", "0.1"))
+    }
 
 
 if __name__ == "__main__":

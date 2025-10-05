@@ -1,172 +1,335 @@
 import os
-import pandas as pd
 import json
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
+import pickle
+import csv
+import re
 from pathlib import Path
-from importlib.resources import files
-from rich import print
+from typing import List, Dict
+import numpy as np
+from langchain.schema import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from rank_bm25 import BM25Okapi
+from rich.console import Console
+from rich.progress import track
+
+console = Console()
 
 
-# project_root = Path(__file__).resolve().parents[2]  # As script folder is placed in the same level as the repo root
-# csv_path = project_root / "scripts" / "docs" / "documentation_data.csv"
-# postman_path = project_root / "scripts" / "Encompass_Developer_Connect_postman_collection.json"
+class EncompassDocumentProcessor:
+    """Process Context7, CSV documentation, and Postman data for vector store creation"""
 
+    def __init__(self):
+        self.api_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1500,
+            chunk_overlap=200,
+            separators=["\n## ", "\n### ", "\n\n", "\n", " "],
+            keep_separator=True
+        )
 
-def setup_vector_store():
-    """Set up the vector store for the RAG system"""
-    print("Setting up vector store...")
-    vector_store_path = str(files("rag_docs.src.rag_docs").joinpath("vector_store"))
-    csv_path = str(files("rag_docs.src.rag_docs.data").joinpath("documentation_data.csv"))
-    postman_path = str(
-        files("rag_docs.src.rag_docs.data").joinpath("Encompass_Developer_Connect_postman_collection.json"))
+        self.postman_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=800,
+            chunk_overlap=100,
+            separators=["\n\n", "\n", ", "],
+            keep_separator=True
+        )
 
-    if not os.path.exists(csv_path):
-        print(f"ERROR: Documentation CSV file not found at {csv_path}")
-        return False
+    def process_csv_documentation(self, file_path: str) -> List[Document]:
+        """Process CSV documentation file"""
+        documents = []
 
-    if not os.path.exists(postman_path):
-        print(f"ERROR: Postman collection file not found at {postman_path}")
-        return False
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
 
-    if os.path.exists(vector_store_path):
-        print(f"Vector store already exists at {vector_store_path}")
-        choice = input("Do you want to recreate it? (y/n): ").lower()
-        if choice != 'y':
-            print("Setup aborted.")
-            return False
+                for row in track(reader, description="Processing CSV documentation..."):
+                    url = row.get('url', '')
+                    title = row.get('title', '')
+                    content = row.get('content', '')
 
-    print("Loading documentation data...")
-    try:
-        df = pd.read_csv(csv_path)
-        print(f"Loaded {len(df)} documentation pages")
-    except Exception as e:
-        print(f"Error loading CSV: {str(e)}")
-        return False
+                    if not content or len(content.strip()) < 50:
+                        continue
 
-    print("Loading Postman collection...")
-    try:
-        with open(postman_path, 'r') as f:
-            collection = json.load(f)
-        print(f"Loaded Postman collection: {collection.get('info', {}).get('name', 'Unknown')}")
-    except Exception as e:
-        print(f"Error loading Postman collection: {str(e)}")
-        return False
+                    # Check if it's API endpoint content
+                    if self._is_api_endpoint(content):
+                        doc = Document(
+                            page_content=content,
+                            metadata={
+                                'source': 'csv_docs',
+                                'url': url,
+                                'title': title,
+                                'type': 'api_endpoint',
+                                'chunk_size': len(content)
+                            }
+                        )
+                        documents.append(doc)
+                    else:
+                        # Split longer content into chunks
+                        chunks = self.api_splitter.split_text(content)
+                        for i, chunk in enumerate(chunks):
+                            doc = Document(
+                                page_content=chunk,
+                                metadata={
+                                    'source': 'csv_docs',
+                                    'url': url,
+                                    'title': title,
+                                    'type': 'documentation',
+                                    'chunk_index': i,
+                                    'total_chunks': len(chunks)
+                                }
+                            )
+                            documents.append(doc)
+        except Exception as e:
+            console.print(f"[yellow]Warning: Error processing CSV file: {e}[/yellow]")
 
-    print("Processing documentation...")
-    doc_texts = []
-    for text in df['content'].tolist():
-        # Convert to string if not already a string
-        if not isinstance(text, str):
-            text = str(text)
-        doc_texts.append(text)
+        return documents
 
-    print("Processing Postman collection...")
-    postman_texts = process_postman_collection(collection)
+    def process_context7_file(self, file_path: str) -> List[Document]:
+        """Process Context7 documentation"""
+        documents = []
 
-    print("Combine all texts")
-    all_texts = doc_texts + postman_texts
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
 
-    print("Splitting texts into chunks...")
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        length_function=len,
-    )
+            # Parse Context7 format
+            sections = content.split('\n\n---\n\n')
 
-    chunks = []
-    for text in all_texts:
+            for section in track(sections, description="Processing Context7 sections..."):
+                url_match = re.search(r'URL:\s*(https?://[^\n]+)', section)
+                url = url_match.group(1) if url_match else ""
 
-        if not isinstance(text, str):
-            text = str(text)
-        chunks.extend(text_splitter.split_text(text))
+                if self._is_api_endpoint(section):
+                    doc = Document(
+                        page_content=section,
+                        metadata={
+                            'source': 'context7',
+                            'url': url,
+                            'type': 'api_endpoint',
+                            'chunk_size': len(section)
+                        }
+                    )
+                    documents.append(doc)
+                else:
+                    chunks = self.api_splitter.split_text(section)
+                    for i, chunk in enumerate(chunks):
+                        doc = Document(
+                            page_content=chunk,
+                            metadata={
+                                'source': 'context7',
+                                'url': url,
+                                'type': 'documentation',
+                                'chunk_index': i,
+                                'total_chunks': len(chunks)
+                            }
+                        )
+                        documents.append(doc)
+        except Exception as e:
+            console.print(f"[yellow]Warning: Error processing Context7 file: {e}[/yellow]")
 
-    print(f"Split into {len(chunks)} chunks")
+        return documents
 
-    print("Creating vector store...")
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    vector_store = FAISS.from_texts(chunks, embeddings)
+    def process_postman_collection(self, file_path: str) -> List[Document]:
+        """Process Postman collection"""
+        documents = []
 
-    print(f"Saving vector store to {vector_store_path}...")
-    os.makedirs(vector_store_path, exist_ok=True)
-    vector_store.save_local(vector_store_path)
+        try:
+            with open(file_path, 'r') as f:
+                collection = json.load(f)
 
-    print("Vector store setup completed successfully!")
-    return True
+            items = self._flatten_postman_items(collection)
 
+            for item in track(items, description="Processing Postman endpoints..."):
+                endpoint_text = self._format_endpoint_text(item)
 
-def process_postman_collection(collection):
-    """Process Postman collection into text format"""
-    texts = []
+                doc = Document(
+                    page_content=endpoint_text,
+                    metadata={
+                        'source': 'postman',
+                        'endpoint_name': item.get('name', ''),
+                        'method': item.get('request', {}).get('method', ''),
+                        'path': self._extract_path(item),
+                        'type': 'endpoint',
+                        'raw_data': json.dumps(item)
+                    }
+                )
+                documents.append(doc)
+        except Exception as e:
+            console.print(f"[yellow]Warning: Error processing Postman file: {e}[/yellow]")
 
-    if 'info' in collection:
-        info = collection['info']
-        texts.append(f"Collection Name: {info.get('name', '')}\nDescription: {info.get('description', '')}")
+        return documents
 
-    if 'item' in collection:
-        for item in collection['item']:
-            process_item(item, texts)
-
-    return texts
-
-
-def process_item(item, texts, parent_path=""):
-    """Process a Postman collection item (endpoint or folder)"""
-
-    if 'item' in item:
-        folder_name = item.get('name', 'Unnamed Folder')
-        folder_path = f"{parent_path}/{folder_name}" if parent_path else folder_name
-
-        if 'description' in item:
-            texts.append(f"Folder: {folder_path}\nDescription: {item['description']}")
-
-        for nested_item in item['item']:
-            process_item(nested_item, texts, folder_path)
-
-    elif 'request' in item:
-        endpoint_name = item.get('name', 'Unnamed Endpoint')
-        endpoint_path = f"{parent_path}/{endpoint_name}" if parent_path else endpoint_name
-
-        request = item['request']
+    def _format_endpoint_text(self, item: Dict) -> str:
+        """Format Postman endpoint as searchable text"""
+        request = item.get('request', {})
         method = request.get('method', 'UNKNOWN')
-
-        url = ""
-        if isinstance(request.get('url'), dict):
-            url_parts = request['url'].get('path', [])
-            url = '/'.join(url_parts) if url_parts else request['url'].get('raw', '')
-        else:
-            url = request.get('url', '')
+        path = self._extract_path(item)
+        description = item.get('description', '')
 
         headers = []
-        if 'header' in request:
-            for header in request['header']:
-                headers.append(f"{header.get('key', '')}: {header.get('value', '')}")
+        for header in request.get('header', []):
+            headers.append(f"{header.get('key')}: {header.get('value')}")
 
         body = ""
         if 'body' in request:
-            if request['body'].get('mode') == 'raw':
-                body = request['body'].get('raw', '')
-            elif request['body'].get('mode') == 'formdata':
-                form_items = []
-                for form_item in request['body'].get('formdata', []):
-                    form_items.append(f"{form_item.get('key', '')}: {form_item.get('value', '')}")
-                body = '\n'.join(form_items)
+            body_data = request['body']
+            if body_data.get('mode') == 'raw':
+                body = body_data.get('raw', '')
 
-        description = item.get('description', '')
-
-        endpoint_text = f"""
-Endpoint: {endpoint_path}
+        text = f"""
+Endpoint: {item.get('name', 'Unknown')}
 Method: {method}
-URL: {url}
+Path: {path}
 Description: {description}
-Headers: {', '.join(headers) if headers else 'None'}
-Body: {body}
-"""
-        texts.append(endpoint_text)
 
-    return texts
+Headers:
+{chr(10).join(headers) if headers else 'None'}
+
+Request Body:
+{body if body else 'None'}
+
+Authentication: {request.get('auth', {}).get('type', 'None')}
+"""
+        return text
+
+    def _extract_path(self, item: Dict) -> str:
+        """Extract path from Postman item"""
+        request = item.get('request', {})
+        url = request.get('url', {})
+
+        if isinstance(url, dict):
+            path_parts = url.get('path', [])
+            return '/' + '/'.join(path_parts) if path_parts else url.get('raw', '')
+        return str(url)
+
+    def _flatten_postman_items(self, collection: Dict, items: List = None) -> List:
+        """Recursively flatten Postman collection items"""
+        if items is None:
+            items = []
+
+        if 'item' in collection:
+            for item in collection['item']:
+                if 'item' in item:
+                    self._flatten_postman_items(item, items)
+                else:
+                    items.append(item)
+
+        return items
+
+    def _is_api_endpoint(self, content: str) -> bool:
+        """Check if content describes an API endpoint"""
+        patterns = [
+            r'(GET|POST|PUT|DELETE|PATCH)\s+/',
+            r'endpoint:',
+            r'parameters:',
+            r'response:'
+        ]
+        return any(re.search(p, content, re.I) for p in patterns)
+
+
+def create_optimized_vector_store():
+    """Main function to create the vector store"""
+    console.print("[bold blue]Encompass RAG Vector Store Creator[/bold blue]")
+
+    # Paths
+    csv_docs_path = "data/documentation_data.csv"
+    context7_path = "data/context7_llms.txt"
+    postman_path = "data/Encompass_Developer_Connect_postman_collection.json"
+    vector_store_path = "vector_store"
+
+    # Process documents
+    processor = EncompassDocumentProcessor()
+    all_documents = []
+
+    # Process CSV documentation if it exists
+    if os.path.exists(csv_docs_path):
+        console.print("\n[yellow]Processing CSV documentation...[/yellow]")
+        csv_docs = processor.process_csv_documentation(csv_docs_path)
+        console.print(f"✓ Processed {len(csv_docs)} CSV documents")
+        all_documents.extend(csv_docs)
+    else:
+        console.print(f"[yellow]CSV documentation not found at {csv_docs_path}, skipping...[/yellow]")
+
+    # Process Context7 documentation if it exists
+    if os.path.exists(context7_path):
+        console.print("\n[yellow]Processing Context7 documentation...[/yellow]")
+        context7_docs = processor.process_context7_file(context7_path)
+        console.print(f"✓ Processed {len(context7_docs)} Context7 documents")
+        all_documents.extend(context7_docs)
+    else:
+        console.print(f"[yellow]Context7 file not found at {context7_path}, skipping...[/yellow]")
+
+    # Process Postman collection if it exists
+    if os.path.exists(postman_path):
+        console.print("\n[yellow]Processing Postman collection...[/yellow]")
+        postman_docs = processor.process_postman_collection(postman_path)
+        console.print(f"✓ Processed {len(postman_docs)} Postman endpoints")
+        all_documents.extend(postman_docs)
+    else:
+        console.print(f"[yellow]Postman collection not found at {postman_path}, skipping...[/yellow]")
+
+    if not all_documents:
+        console.print("[red]Error: No documents to process![/red]")
+        return False
+
+    console.print(f"\n[green]Total documents: {len(all_documents)}[/green]")
+
+    # Create embeddings
+    console.print("\n[yellow]Creating embeddings (this may take a while)...[/yellow]")
+    embeddings = HuggingFaceEmbeddings(
+        model_name="BAAI/bge-base-en-v1.5",
+        model_kwargs={'device': 'cpu'},  # Change to 'cuda' if you have GPU
+        encode_kwargs={'normalize_embeddings': True}
+    )
+
+    # Create FAISS vector store
+    console.print("[yellow]Building FAISS index...[/yellow]")
+    vector_store = FAISS.from_documents(all_documents, embeddings)
+
+    # Create BM25 index for hybrid search
+    console.print("[yellow]Creating BM25 index for hybrid search...[/yellow]")
+    texts = [doc.page_content for doc in all_documents]
+    tokenized_texts = [text.lower().split() for text in texts]
+    bm25 = BM25Okapi(tokenized_texts)
+
+    # Save everything
+    console.print("\n[yellow]Saving vector store and indices...[/yellow]")
+    os.makedirs(vector_store_path, exist_ok=True)
+
+    vector_store.save_local(vector_store_path)
+
+    with open(f"{vector_store_path}/bm25_index.pkl", 'wb') as f:
+        pickle.dump(bm25, f)
+
+    with open(f"{vector_store_path}/documents_metadata.pkl", 'wb') as f:
+        pickle.dump([doc.metadata for doc in all_documents], f)
+
+    # Save statistics
+    stats = {
+        'total_documents': len(all_documents),
+        'csv_documents': len([d for d in all_documents if d.metadata.get('source') == 'csv_docs']),
+        'context7_documents': len([d for d in all_documents if d.metadata.get('source') == 'context7']),
+        'postman_endpoints': len([d for d in all_documents if d.metadata.get('source') == 'postman']),
+        'embedding_model': 'BAAI/bge-base-en-v1.5',
+        'chunk_sizes': {
+            'api_documentation': 1500,
+            'postman_endpoints': 800
+        }
+    }
+
+    with open(f"{vector_store_path}/stats.json", 'w') as f:
+        json.dump(stats, f, indent=2)
+
+    console.print(f"\n[bold green]✓ Vector store created successfully at '{vector_store_path}'[/bold green]")
+    console.print("\nStatistics:")
+    console.print(f"  • CSV documents: {stats['csv_documents']}")
+    console.print(f"  • Context7 documents: {stats['context7_documents']}")
+    console.print(f"  • Postman endpoints: {stats['postman_endpoints']}")
+    console.print(f"  • Total chunks: {len(all_documents)}")
+
+    return True
 
 
 if __name__ == "__main__":
-    setup_vector_store()
+    create_optimized_vector_store()
