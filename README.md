@@ -55,7 +55,7 @@ The system features a sophisticated multi-component architecture:
 - **Streamlit UI**: Enhanced interface with categorized source display
 - **CORS Support**: Ready for web application integration
 
-![Flowchart of the process](flowchart.png)
+![Flowchart of the process](Flowchart.png)
 
 ## Installation
 
