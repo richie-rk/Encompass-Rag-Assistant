@@ -7,7 +7,9 @@ A sophisticated Retrieval-Augmented Generation (RAG) system for querying Encompa
 - [Overview](#overview)
 - [Features](#features)
 - [Architecture](#architecture)
-- [Latest Updates](#latest-updates)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Configuration](#configuration)
 
 ## Overview
 
@@ -53,17 +55,6 @@ The system features a sophisticated multi-component architecture:
 - **Streamlit UI**: Enhanced interface with categorized source display
 - **CORS Support**: Ready for web application integration
 
-## Latest Updates
-
-
-- **Hybrid Retrieval**: Implemented semantic + keyword search combination
-- **Multi-LLM Support**: Added Google Gemini alongside Ollama
-- **Enhanced Embeddings**: Upgraded to BAAI/bge-base-en-v1.5
-- **Source Categorization**: Organized responses by source type (Context7, Postman, CSV)
-- **Environment Configuration**: Full .env support for all settings
-- **API Enhancements**: Added health checks and configuration endpoints
-- **Improved Architecture**: Better separation of concerns and modularity
-
 ![Flowchart of the process](flowchart.png)
 
 ## Installation
@@ -73,12 +64,13 @@ The system features a sophisticated multi-component architecture:
 - Ollama (for local LLM hosting) OR Google Gemini API key
 - CUDA-compatible GPU recommended for embeddings
 - 16GB+ RAM recommended for optimal performance
+- Optional: [uv](https://docs.astral.sh/uv/) for faster package installation
 
 ### Setup
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/encompass-rag-assistant.git
+   git clone https://github.com/richie-rk/encompass-rag-assistant.git
    cd encompass-rag-assistant
    ```
 
@@ -88,10 +80,31 @@ The system features a sophisticated multi-component architecture:
    source venv/bin/activate  # On Windows: venv\Scripts\activate
    ```
 
-3. Install dependencies:
+3. **Install dependencies** (choose one method):
+
+   **Option A: Modern approach with pyproject.toml (Recommended)**
+   ```bash
+   uv pip install -e .
+   
+   # With development dependencies
+   uv pip install -e ".[dev]"
+   
+   # With GPU support (faiss-gpu)
+   uv pip install -e ".[gpu]"
+   
+   # Install everything (all optional dependencies)
+   uv pip install -e ".[all]"
+   ```
+
+   **Option B: Traditional approach with requirements.txt**
    ```bash
    pip install -r requirements.txt
    ```
+
+   > **💡 Which method to choose?**
+   > - **pyproject.toml (Option A)**: Modern Python packaging standard, supports optional dependencies, better dependency resolution, and works with both pip and uv
+   > - **requirements.txt (Option B)**: Traditional approach, compatible with older tools and workflows
+   > - **uv**: Significantly faster installation times compared to pip
 
 4. **LLM Setup** (Choose one):
 
@@ -198,5 +211,16 @@ PORT=8000
 # Logging
 LOG_LEVEL=INFO
 ```
+
+## Building the Package
+
+```bash
+# Build wheel and source distribution
+python -m build
+
+# Or with uv (faster)
+uv build
+```
+---
 
 Built with ❤️ for Encompass API users
