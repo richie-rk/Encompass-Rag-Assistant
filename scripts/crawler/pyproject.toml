@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "developer-connect-crawler"
+version = "0.1.0"
+description = "Sidebar-driven crawler for ICE MT Developer Connect docs (ReadMe-hosted)"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+    {name = "richie-rk"},
+]
+keywords = ["crawler", "scraper", "readme.io", "encompass", "developer-connect"]
+
+# Runtime deps — intentionally minimal. No langchain / torch / faiss.
+dependencies = [
+    "requests>=2.31",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "black>=23.0",
+    "isort>=5.12",
+    "mypy>=1.0",
+]
+
+[project.scripts]
+# Installs an executable on PATH. Same as `python -m crawler`.
+developer-connect-crawl = "crawler.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+# Map this directory's Python files into a top-level `crawler` package
+# so it imports as `import crawler` after install.
+include = ["*.py"]
+
+[tool.hatch.build.targets.wheel.sources]
+"." = "crawler"
+
+[tool.hatch.build]
+exclude = [
+    "__pycache__/",
+    "*.pyc",
+    ".tmp_*",
+    "pyproject.toml",
+    "README.md",
+]
+
+[tool.black]
+line-length = 88
+target-version = ["py311"]
+
+[tool.isort]
+profile = "black"
+line_length = 88
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
