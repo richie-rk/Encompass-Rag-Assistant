@@ -33,7 +33,11 @@ dependencies = [
     "langchain-text-splitters>=0.3.9",
     "langchain-google-genai>=0.0.11",
     "faiss-cpu>=1.11.0",
-    "sentence-transformers>=5.0.0",
+    # Pinned exact: transformers 4.57+ also dropped `all_tied_weights_keys`,
+    # which breaks Jina v3's custom remote code (`XLMRobertaLoRA`) at encode
+    # time. Only this combo is verified to work end-to-end.
+    "sentence-transformers==5.1.1",
+    "transformers==4.56.2",
     "rank-bm25>=0.2.2",
     "streamlit>=1.47.1",
     "fastapi>=0.116.1",
@@ -46,6 +50,8 @@ dependencies = [
     "pandas>=2.3.1",
     "scikit-learn>=1.7.1",
     "ollama>=0.5.1",
+    "einops>=0.7.0",
+    "requests>=2.31.0",
 ]
 
 [project.optional-dependencies]
@@ -59,10 +65,27 @@ dev = [
     "pre-commit>=3.0.0",
 ]
 gpu = [
+    # `torch` is also in the main deps (CPU build by default). Listing it again
+    # here lets the `[tool.uv.sources]` marker route it through the PyTorch CUDA
+    # index when this extra is selected.
+    "torch>=2.7.1",
     "faiss-gpu>=1.7.4",
 ]
 all = [
     "encompass-rag-assistant[dev,gpu]",
+]
+
+# When installed with `uv pip install -e ".[gpu]"`, route torch through PyTorch's
+# CUDA 12.1 wheels index. Plain `uv pip install -e .` continues to pull CPU torch
+# from PyPI (no marker match). Pip users without uv: see README "Hardware setup".
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu121", marker = "extra == 'gpu'" },
 ]
 
 [project.urls]

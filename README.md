@@ -20,7 +20,7 @@ This application combines cutting-edge RAG techniques with a user-friendly inter
 ## Features
 
 - **Hybrid Retrieval System**: Combines FAISS semantic search with BM25 keyword search for superior accuracy
-- **Multi-LLM Support**: Choose between Ollama (deepseek-coder-v2:16b) and Google Gemini models
+- **Multi-LLM Support**: Choose between Ollama (qwen2.5-coder:7b) and Google Gemini models
 - **Advanced Embeddings**: Uses BAAI/bge-base-en-v1.5 for superior semantic understanding
 - **Categorized Sources**: Responses include categorized sources (Context7, Postman, CSV documentation)
 - **Multiple Data Sources**: Integrates Context7 LLM data, Postman collections, and CSV documentation
@@ -45,7 +45,7 @@ The system features a sophisticated multi-component architecture:
 - **Score Normalization**: Advanced scoring system for optimal result ranking
 
 ### **LLM Integration**
-- **Ollama Support**: Local LLM hosting with deepseek-coder-v2:16b
+- **Ollama Support**: Local LLM hosting with qwen2.5-coder:7b
 - **Google Gemini**: Cloud-based gemini-1.5-flash model option
 - **LangChain Integration**: Standardized LLM interface with RetrievalQA chains
 
@@ -80,38 +80,67 @@ The system features a sophisticated multi-component architecture:
    source venv/bin/activate  # On Windows: venv\Scripts\activate
    ```
 
-3. **Install dependencies** (choose one method):
+3. **Install dependencies** — pick the path that matches your hardware. The
+   only thing that differs is which `torch` build gets installed; the
+   application code dispatches to CPU or GPU at runtime via `JINA_DEVICE`
+   in `.env`.
 
-   **Option A: Modern approach with pyproject.toml (Recommended)**
+   **Option A — uv with pyproject.toml (recommended)**
+
+   *CPU only* (works everywhere; embedding pipeline runs on CPU):
    ```bash
    uv pip install -e .
-   
-   # With development dependencies
-   uv pip install -e ".[dev]"
-   
-   # With GPU support (faiss-gpu)
+   ```
+
+   *NVIDIA GPU (CUDA 12.1)* — pulls CUDA-enabled `torch` + `faiss-gpu`:
+   ```bash
    uv pip install -e ".[gpu]"
-   
-   # Install everything (all optional dependencies)
+   ```
+
+   *With dev extras*:
+   ```bash
+   uv pip install -e ".[dev]"
+   uv pip install -e ".[dev,gpu]"   # GPU + dev tools
+   ```
+
+   *Everything*:
+   ```bash
    uv pip install -e ".[all]"
    ```
 
-   **Option B: Traditional approach with requirements.txt**
+   **Option B — plain pip (no uv)**
+
+   *CPU*:
    ```bash
-   pip install -r requirements.txt
+   pip install -e .
+   # or:  pip install -r requirements.txt
+   ```
+
+   *NVIDIA GPU (CUDA 12.1)* — pip can't auto-route `torch` to the PyTorch
+   index from `pyproject.toml`, so the GPU build is a two-step:
+   ```bash
+   pip install -e .
+   pip uninstall -y torch
+   pip install torch --index-url https://download.pytorch.org/whl/cu121
+   pip install faiss-gpu>=1.7.4
    ```
 
    > **💡 Which method to choose?**
-   > - **pyproject.toml (Option A)**: Modern Python packaging standard, supports optional dependencies, better dependency resolution, and works with both pip and uv
-   > - **requirements.txt (Option B)**: Traditional approach, compatible with older tools and workflows
-   > - **uv**: Significantly faster installation times compared to pip
+   > - **uv (Option A)**: significantly faster installs; auto-routes `torch`
+   >   to the right index when you pick `[gpu]`. Recommended.
+   > - **pip (Option B)**: works without extra tooling; needs the manual
+   >   torch swap above for GPU.
+   >
+   > **💡 Hardware setup**
+   > After install, set `JINA_DEVICE=cuda` (or `mps` on Apple silicon) in
+   > `.env` to actually use the GPU at embedding time. Default is `cpu`.
 
 4. **LLM Setup** (Choose one):
 
    **Option A: Ollama (Local)**
    ```bash
    # Install Ollama from https://ollama.ai/
-   ollama pull deepseek-coder-v2:16b
+   ollama pull qwen2.5-coder:7b
    ```
 
    **Option B: Google Gemini (Cloud)**
@@ -127,7 +156,36 @@ The system features a sophisticated multi-component architecture:
    # Edit .env with your preferred configuration
    ```
 
-6. **Create the vector store**:
+6. **Crawl the Developer Connect documentation**:
+   ```bash
+   # From the repo root — fetches all guide / API-reference / changelog pages
+   # for /developer-connect/ and writes scripts/data/developer_connect.jsonl
+   python -m scripts.crawler
+   ```
+
+   The crawler enumerates the page frontier from the ReadMe sidebar (no BFS) and
+   extracts each page's authored Markdown, OpenAPI spec, and metadata directly
+   from the embedded `ssr-props` JSON. First run takes ~5–7 minutes (216 pages
+   at 0.5 s delay); HTML is cached to `scripts/data/cache/`, so re-runs are
+   instant.
+
+   Useful flags:
+   ```bash
+   python -m scripts.crawler --dry-run              # enumerate frontier, no fetches
+   python -m scripts.crawler --limit 10             # debug: only first 10 pages
+   python -m scripts.crawler --no-cache             # ignore cache, refetch all
+   python -m scripts.crawler --include-hidden       # include hidden:true pages
+   python -m scripts.crawler --delay 1.0            # slower pace for politeness
+   python -m scripts.crawler --help                 # full option list
+   ```
+
+   Outputs:
+   - `scripts/data/developer_connect.jsonl` — one record per page (slug, title,
+     URL, breadcrumb, `body_md`, OpenAPI `oas`, `updated_at`, …)
+   - `scripts/data/developer_connect_manifest.jsonl` — per-URL fetch log with
+     status, cache-hit, body hash, and any error reason
+
+7. **Create the vector store**:
    ```bash
    python scripts/create_vector_store.py
    ```
@@ -167,14 +225,19 @@ The application is fully configurable through environment variables or a `.env` 
 
 ```bash
 # LLM Configuration
-OLLAMA_MODEL=deepseek-coder-v2:16b
+OLLAMA_MODEL=qwen2.5-coder:7b
 USE_GEMINI=false
 GEMINI_API_KEY=your_gemini_api_key_here
 TEMPERATURE=0.1
 
 # Vector Store Configuration
 VECTOR_STORE_PATH=vector_store
-EMBEDDING_MODEL=BAAI/bge-base-en-v1.5
+
+# Embeddings (Jina v3)
+JINA_BACKEND=local              # `local` (sentence-transformers) or `api`
+JINA_API_KEY=                   # required when JINA_BACKEND=api
+JINA_MODEL=jinaai/jina-embeddings-v3
+JINA_DEVICE=cpu                 # `cpu`, `cuda`, or `mps`
 
 # API Configuration
 HOST=0.0.0.0
@@ -197,7 +260,7 @@ RETRIEVAL_K=5     # Number of documents to retrieve
 ```env
 # Choose your LLM provider
 USE_GEMINI=false
-OLLAMA_MODEL=deepseek-coder-v2:16b
+OLLAMA_MODEL=qwen2.5-coder:7b
 # GEMINI_API_KEY=your_key_here
 
 # Vector store settings

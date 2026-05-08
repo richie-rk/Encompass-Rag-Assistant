@@ -1,335 +1,285 @@
-import os
+"""Build the three-index vector store for the RAG pipeline.
+
+Inputs:
+  - scripts/data/developer_connect.jsonl   (BFS-crawled documentation)
+  - scripts/data/Encompass_Developer_Connect_postman_collection.json
+
+Outputs (under VECTOR_STORE_PATH, default `vector_store/`):
+  - jsonl_faiss/index.faiss + index.pkl   (LangChain FAISS-IP, Jina v3 vectors)
+  - jsonl_bm25.pkl + jsonl_chunks.pkl     (BM25 over the same chunks)
+  - postman_bm25.pkl + postman_entries.pkl (separate BM25 for endpoint surfacing)
+  - stats.json                            (chunk/index counts for sanity)
+
+Pipeline per record:
+  filter -> dedupe -> chunk (page-wise/<=2K, otherwise 1500/200 with headers)
+  -> embed via Jina v3 (task=retrieval.passage)
+  -> FAISS-IP + BM25.
+
+Run from the repo root:
+    python -m scripts.create_vector_store
+"""
+from __future__ import annotations
+
+import hashlib
 import json
+import os
 import pickle
-import csv
-import re
+import sys
 from pathlib import Path
-from typing import List, Dict
+from typing import Dict, List
+
 import numpy as np
+from dotenv import load_dotenv
 from langchain.schema import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores.utils import DistanceStrategy
 from rank_bm25 import BM25Okapi
 from rich.console import Console
-from rich.progress import track
+from rich.progress import (
+    BarColumn, MofNCompleteColumn, Progress, TextColumn,
+    TimeElapsedColumn, TimeRemainingColumn,
+)
+
+# Repo-root-relative imports work because we run from the repo root.
+from scripts.ingest.chunking import Chunk, chunk_records
+from scripts.ingest.dedupe import dedupe_by_content
+from scripts.ingest.jina_embedder import JinaEmbedder
+from scripts.ingest.postman import load_postman_entries, tokenize_query
 
 console = Console()
+load_dotenv()
 
 
-class EncompassDocumentProcessor:
-    """Process Context7, CSV documentation, and Postman data for vector store creation"""
+# --- Paths --------------------------------------------------------------------
 
-    def __init__(self):
-        self.api_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1500,
-            chunk_overlap=200,
-            separators=["\n## ", "\n### ", "\n\n", "\n", " "],
-            keep_separator=True
+REPO_ROOT = Path(__file__).resolve().parents[1]
+JSONL_PATH = REPO_ROOT / "scripts" / "data" / "developer_connect.jsonl"
+POSTMAN_PATH = REPO_ROOT / "scripts" / "data" / "Encompass_Developer_Connect_postman_collection.json"
+VECTOR_STORE_PATH = Path(os.getenv("VECTOR_STORE_PATH", "vector_store"))
+
+
+# --- Steps --------------------------------------------------------------------
+
+def _load_jsonl(path: Path) -> List[Dict]:
+    records: List[Dict] = []
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            records.append(json.loads(line))
+    return records
+
+
+def _filter_records(records: List[Dict]) -> List[Dict]:
+    """Drop record types we don't ingest."""
+    out = []
+    for r in records:
+        if r.get("type") == "custompage":
+            continue  # 4 records, all empty after extraction (deferred fix)
+        out.append(r)
+    return out
+
+
+def _chunks_to_documents(chunks: List[Chunk]) -> List[Document]:
+    return [Document(page_content=c.page_content, metadata=c.metadata) for c in chunks]
+
+
+def _texts_fingerprint(texts: List[str]) -> str:
+    """Stable hash of the chunk text list. If chunking parameters change, this
+    changes — we use it to invalidate stale checkpoints."""
+    h = hashlib.sha256()
+    for t in texts:
+        h.update(t.encode("utf-8"))
+        h.update(b"\x00")
+    return h.hexdigest()
+
+
+def _embed_with_checkpoint(
+    texts: List[str], embedder: JinaEmbedder, checkpoint: Path,
+    *, save_every: int = 512,
+) -> np.ndarray:
+    """Embed all `texts` with on-disk resumability.
+
+    The Jina API can rate-limit mid-build; this lets a re-run pick up where it
+    left off instead of re-paying for already-embedded chunks. The checkpoint
+    file holds however many vectors we've successfully computed so far (in the
+    same order as `texts`); a sidecar JSON tracks the chunk-list fingerprint
+    so a checkpoint from a different chunking config doesn't silently apply.
+    """
+    meta_path = checkpoint.with_suffix(".meta.json")
+    fingerprint = _texts_fingerprint(texts)
+
+    if checkpoint.exists() and meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if meta.get("fingerprint") == fingerprint:
+            existing = np.load(checkpoint)
+            if existing.shape[0] >= len(texts):
+                console.print(f"  [dim]checkpoint complete ({existing.shape[0]} vectors); skipping embed[/dim]")
+                return existing[: len(texts)]
+            console.print(f"  [dim]resuming from checkpoint ({existing.shape[0]}/{len(texts)} embedded)[/dim]")
+            vectors = existing
+        else:
+            console.print("  [yellow]checkpoint stale (chunks changed) — embedding from scratch[/yellow]")
+            vectors = np.zeros((0, 1024), dtype=np.float32)
+    else:
+        vectors = np.zeros((0, 1024), dtype=np.float32)
+
+    def _persist(v: np.ndarray) -> None:
+        np.save(checkpoint, v)
+        meta_path.write_text(
+            json.dumps({"fingerprint": fingerprint, "count": int(v.shape[0])}),
+            encoding="utf-8",
         )
 
-        self.postman_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=800,
-            chunk_overlap=100,
-            separators=["\n\n", "\n", ", "],
-            keep_separator=True
-        )
-
-    def process_csv_documentation(self, file_path: str) -> List[Document]:
-        """Process CSV documentation file"""
-        documents = []
-
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-
-                for row in track(reader, description="Processing CSV documentation..."):
-                    url = row.get('url', '')
-                    title = row.get('title', '')
-                    content = row.get('content', '')
-
-                    if not content or len(content.strip()) < 50:
-                        continue
-
-                    # Check if it's API endpoint content
-                    if self._is_api_endpoint(content):
-                        doc = Document(
-                            page_content=content,
-                            metadata={
-                                'source': 'csv_docs',
-                                'url': url,
-                                'title': title,
-                                'type': 'api_endpoint',
-                                'chunk_size': len(content)
-                            }
-                        )
-                        documents.append(doc)
-                    else:
-                        # Split longer content into chunks
-                        chunks = self.api_splitter.split_text(content)
-                        for i, chunk in enumerate(chunks):
-                            doc = Document(
-                                page_content=chunk,
-                                metadata={
-                                    'source': 'csv_docs',
-                                    'url': url,
-                                    'title': title,
-                                    'type': 'documentation',
-                                    'chunk_index': i,
-                                    'total_chunks': len(chunks)
-                                }
-                            )
-                            documents.append(doc)
-        except Exception as e:
-            console.print(f"[yellow]Warning: Error processing CSV file: {e}[/yellow]")
-
-        return documents
-
-    def process_context7_file(self, file_path: str) -> List[Document]:
-        """Process Context7 documentation"""
-        documents = []
-
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-
-            # Parse Context7 format
-            sections = content.split('\n\n---\n\n')
-
-            for section in track(sections, description="Processing Context7 sections..."):
-                url_match = re.search(r'URL:\s*(https?://[^\n]+)', section)
-                url = url_match.group(1) if url_match else ""
-
-                if self._is_api_endpoint(section):
-                    doc = Document(
-                        page_content=section,
-                        metadata={
-                            'source': 'context7',
-                            'url': url,
-                            'type': 'api_endpoint',
-                            'chunk_size': len(section)
-                        }
-                    )
-                    documents.append(doc)
-                else:
-                    chunks = self.api_splitter.split_text(section)
-                    for i, chunk in enumerate(chunks):
-                        doc = Document(
-                            page_content=chunk,
-                            metadata={
-                                'source': 'context7',
-                                'url': url,
-                                'type': 'documentation',
-                                'chunk_index': i,
-                                'total_chunks': len(chunks)
-                            }
-                        )
-                        documents.append(doc)
-        except Exception as e:
-            console.print(f"[yellow]Warning: Error processing Context7 file: {e}[/yellow]")
-
-        return documents
-
-    def process_postman_collection(self, file_path: str) -> List[Document]:
-        """Process Postman collection"""
-        documents = []
-
-        try:
-            with open(file_path, 'r') as f:
-                collection = json.load(f)
-
-            items = self._flatten_postman_items(collection)
-
-            for item in track(items, description="Processing Postman endpoints..."):
-                endpoint_text = self._format_endpoint_text(item)
-
-                doc = Document(
-                    page_content=endpoint_text,
-                    metadata={
-                        'source': 'postman',
-                        'endpoint_name': item.get('name', ''),
-                        'method': item.get('request', {}).get('method', ''),
-                        'path': self._extract_path(item),
-                        'type': 'endpoint',
-                        'raw_data': json.dumps(item)
-                    }
-                )
-                documents.append(doc)
-        except Exception as e:
-            console.print(f"[yellow]Warning: Error processing Postman file: {e}[/yellow]")
-
-        return documents
-
-    def _format_endpoint_text(self, item: Dict) -> str:
-        """Format Postman endpoint as searchable text"""
-        request = item.get('request', {})
-        method = request.get('method', 'UNKNOWN')
-        path = self._extract_path(item)
-        description = item.get('description', '')
-
-        headers = []
-        for header in request.get('header', []):
-            headers.append(f"{header.get('key')}: {header.get('value')}")
-
-        body = ""
-        if 'body' in request:
-            body_data = request['body']
-            if body_data.get('mode') == 'raw':
-                body = body_data.get('raw', '')
-
-        text = f"""
-Endpoint: {item.get('name', 'Unknown')}
-Method: {method}
-Path: {path}
-Description: {description}
-
-Headers:
-{chr(10).join(headers) if headers else 'None'}
-
-Request Body:
-{body if body else 'None'}
-
-Authentication: {request.get('auth', {}).get('type', 'None')}
-"""
-        return text
-
-    def _extract_path(self, item: Dict) -> str:
-        """Extract path from Postman item"""
-        request = item.get('request', {})
-        url = request.get('url', {})
-
-        if isinstance(url, dict):
-            path_parts = url.get('path', [])
-            return '/' + '/'.join(path_parts) if path_parts else url.get('raw', '')
-        return str(url)
-
-    def _flatten_postman_items(self, collection: Dict, items: List = None) -> List:
-        """Recursively flatten Postman collection items"""
-        if items is None:
-            items = []
-
-        if 'item' in collection:
-            for item in collection['item']:
-                if 'item' in item:
-                    self._flatten_postman_items(item, items)
-                else:
-                    items.append(item)
-
-        return items
-
-    def _is_api_endpoint(self, content: str) -> bool:
-        """Check if content describes an API endpoint"""
-        patterns = [
-            r'(GET|POST|PUT|DELETE|PATCH)\s+/',
-            r'endpoint:',
-            r'parameters:',
-            r'response:'
-        ]
-        return any(re.search(p, content, re.I) for p in patterns)
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(), MofNCompleteColumn(),
+        TimeElapsedColumn(), TimeRemainingColumn(), console=console,
+    ) as bar:
+        task = bar.add_task("Embedding chunks", total=len(texts), completed=int(vectors.shape[0]))
+        while vectors.shape[0] < len(texts):
+            start = int(vectors.shape[0])
+            end = min(start + save_every, len(texts))
+            new_vecs = embedder.embed_passages(texts[start:end])
+            vectors = np.vstack([vectors, new_vecs]) if vectors.size else new_vecs
+            _persist(vectors)
+            bar.update(task, completed=int(vectors.shape[0]))
+    return vectors
 
 
-def create_optimized_vector_store():
-    """Main function to create the vector store"""
-    console.print("[bold blue]Encompass RAG Vector Store Creator[/bold blue]")
-
-    # Paths
-    csv_docs_path = "data/documentation_data.csv"
-    context7_path = "data/context7_llms.txt"
-    postman_path = "data/Encompass_Developer_Connect_postman_collection.json"
-    vector_store_path = "vector_store"
-
-    # Process documents
-    processor = EncompassDocumentProcessor()
-    all_documents = []
-
-    # Process CSV documentation if it exists
-    if os.path.exists(csv_docs_path):
-        console.print("\n[yellow]Processing CSV documentation...[/yellow]")
-        csv_docs = processor.process_csv_documentation(csv_docs_path)
-        console.print(f"✓ Processed {len(csv_docs)} CSV documents")
-        all_documents.extend(csv_docs)
-    else:
-        console.print(f"[yellow]CSV documentation not found at {csv_docs_path}, skipping...[/yellow]")
-
-    # Process Context7 documentation if it exists
-    if os.path.exists(context7_path):
-        console.print("\n[yellow]Processing Context7 documentation...[/yellow]")
-        context7_docs = processor.process_context7_file(context7_path)
-        console.print(f"✓ Processed {len(context7_docs)} Context7 documents")
-        all_documents.extend(context7_docs)
-    else:
-        console.print(f"[yellow]Context7 file not found at {context7_path}, skipping...[/yellow]")
-
-    # Process Postman collection if it exists
-    if os.path.exists(postman_path):
-        console.print("\n[yellow]Processing Postman collection...[/yellow]")
-        postman_docs = processor.process_postman_collection(postman_path)
-        console.print(f"✓ Processed {len(postman_docs)} Postman endpoints")
-        all_documents.extend(postman_docs)
-    else:
-        console.print(f"[yellow]Postman collection not found at {postman_path}, skipping...[/yellow]")
-
-    if not all_documents:
-        console.print("[red]Error: No documents to process![/red]")
-        return False
-
-    console.print(f"\n[green]Total documents: {len(all_documents)}[/green]")
-
-    # Create embeddings
-    console.print("\n[yellow]Creating embeddings (this may take a while)...[/yellow]")
-    embeddings = HuggingFaceEmbeddings(
-        model_name="BAAI/bge-base-en-v1.5",
-        model_kwargs={'device': 'cpu'},  # Change to 'cuda' if you have GPU
-        encode_kwargs={'normalize_embeddings': True}
+def _build_jsonl_indices(
+    documents: List[Document], vectors: np.ndarray, embedder: JinaEmbedder,
+) -> "FAISS":
+    """Build FAISS-IP from precomputed vectors so we don't re-embed on retry."""
+    text_emb_pairs = list(zip(
+        (d.page_content for d in documents),
+        vectors.tolist(),
+    ))
+    metadatas = [d.metadata for d in documents]
+    vector_store = FAISS.from_embeddings(
+        text_emb_pairs,
+        embedding=embedder.as_langchain(),
+        metadatas=metadatas,
+        distance_strategy=DistanceStrategy.MAX_INNER_PRODUCT,
+        normalize_L2=False,  # Jina v3 returns unit vectors already.
     )
+    return vector_store
 
-    # Create FAISS vector store
-    console.print("[yellow]Building FAISS index...[/yellow]")
-    vector_store = FAISS.from_documents(all_documents, embeddings)
 
-    # Create BM25 index for hybrid search
-    console.print("[yellow]Creating BM25 index for hybrid search...[/yellow]")
-    texts = [doc.page_content for doc in all_documents]
-    tokenized_texts = [text.lower().split() for text in texts]
-    bm25 = BM25Okapi(tokenized_texts)
+def _build_jsonl_bm25(documents: List[Document]) -> tuple[BM25Okapi, List[List[str]]]:
+    tokenized = [tokenize_query(d.page_content) for d in documents]
+    return BM25Okapi(tokenized), tokenized
 
-    # Save everything
-    console.print("\n[yellow]Saving vector store and indices...[/yellow]")
-    os.makedirs(vector_store_path, exist_ok=True)
 
-    vector_store.save_local(vector_store_path)
+def _build_postman_bm25(entries) -> BM25Okapi:
+    return BM25Okapi([e.tokens for e in entries])
 
-    with open(f"{vector_store_path}/bm25_index.pkl", 'wb') as f:
-        pickle.dump(bm25, f)
 
-    with open(f"{vector_store_path}/documents_metadata.pkl", 'wb') as f:
-        pickle.dump([doc.metadata for doc in all_documents], f)
+# --- Orchestrator -------------------------------------------------------------
 
-    # Save statistics
+def main() -> int:
+    console.rule("[bold]Encompass RAG vector store build[/bold]")
+    console.print(f"  jsonl   : {JSONL_PATH}")
+    console.print(f"  postman : {POSTMAN_PATH}")
+    console.print(f"  output  : {VECTOR_STORE_PATH.resolve()}")
+
+    if not JSONL_PATH.exists():
+        console.print(f"[red]Missing input: {JSONL_PATH}[/red]")
+        return 1
+    if not POSTMAN_PATH.exists():
+        console.print(f"[red]Missing input: {POSTMAN_PATH}[/red]")
+        return 1
+
+    # 1) Load + filter + dedupe
+    records = _load_jsonl(JSONL_PATH)
+    console.print(f"\n[cyan]Loaded {len(records)} records[/cyan]")
+
+    records = _filter_records(records)
+    console.print(f"  after filter (drop custompage): {len(records)}")
+
+    kept, dropped = dedupe_by_content(records)
+    console.print(f"  after dedupe by body_md hash:   {len(kept)} (dropped {len(dropped)} dup{'s' if len(dropped)!=1 else ''})")
+    if dropped:
+        for r in dropped[:5]:
+            console.print(f"    [dim]dropped:[/dim] {r['url']}")
+        if len(dropped) > 5:
+            console.print(f"    [dim]... and {len(dropped) - 5} more[/dim]")
+
+    # 2) Chunk
+    chunks = chunk_records(kept)
+    console.print(f"\n[cyan]Chunked into {len(chunks)} chunks[/cyan]")
+    if not chunks:
+        console.print("[red]No chunks produced; aborting.[/red]")
+        return 1
+    documents = _chunks_to_documents(chunks)
+
+    # Quick chunk-size sanity
+    sizes = sorted(len(c.page_content) for c in chunks)
+    console.print(f"  chunk char sizes: min={sizes[0]}  median={sizes[len(sizes)//2]}  "
+                  f"p95={sizes[int(len(sizes)*0.95)]}  max={sizes[-1]}")
+
+    # 3) Embed (with on-disk checkpoint) + FAISS index
+    embedder = JinaEmbedder.from_env()
+    console.print(f"\n[cyan]Jina backend: {embedder.backend}  model: {embedder.model_name}  device: {embedder.device}[/cyan]")
+    VECTOR_STORE_PATH.mkdir(parents=True, exist_ok=True)
+    checkpoint = VECTOR_STORE_PATH / "_jsonl_embeddings_checkpoint.npy"
+    texts = [d.page_content for d in documents]
+    vectors = _embed_with_checkpoint(texts, embedder, checkpoint)
+    vector_store = _build_jsonl_indices(documents, vectors, embedder)
+
+    # 4) JSONL BM25
+    console.print("\n[yellow]Building JSONL BM25...[/yellow]")
+    jsonl_bm25, _ = _build_jsonl_bm25(documents)
+
+    # 5) Postman
+    console.print("\n[yellow]Loading + indexing Postman collection...[/yellow]")
+    postman_entries = load_postman_entries(POSTMAN_PATH)
+    postman_bm25 = _build_postman_bm25(postman_entries)
+    console.print(f"  postman entries: {len(postman_entries)}")
+
+    # 6) Save
+    console.print(f"\n[yellow]Writing artifacts to {VECTOR_STORE_PATH}/...[/yellow]")
+    VECTOR_STORE_PATH.mkdir(parents=True, exist_ok=True)
+
+    faiss_dir = VECTOR_STORE_PATH / "jsonl_faiss"
+    vector_store.save_local(str(faiss_dir))
+
+    with (VECTOR_STORE_PATH / "jsonl_bm25.pkl").open("wb") as f:
+        pickle.dump(jsonl_bm25, f)
+    with (VECTOR_STORE_PATH / "jsonl_chunks.pkl").open("wb") as f:
+        # Persist chunk metadata so the retriever can map BM25 hits back to docs
+        # without reloading the FAISS docstore.
+        pickle.dump(
+            [{"page_content": d.page_content, "metadata": d.metadata} for d in documents],
+            f,
+        )
+    with (VECTOR_STORE_PATH / "postman_bm25.pkl").open("wb") as f:
+        pickle.dump(postman_bm25, f)
+    with (VECTOR_STORE_PATH / "postman_entries.pkl").open("wb") as f:
+        pickle.dump(postman_entries, f)
+
     stats = {
-        'total_documents': len(all_documents),
-        'csv_documents': len([d for d in all_documents if d.metadata.get('source') == 'csv_docs']),
-        'context7_documents': len([d for d in all_documents if d.metadata.get('source') == 'context7']),
-        'postman_endpoints': len([d for d in all_documents if d.metadata.get('source') == 'postman']),
-        'embedding_model': 'BAAI/bge-base-en-v1.5',
-        'chunk_sizes': {
-            'api_documentation': 1500,
-            'postman_endpoints': 800
-        }
+        "records_loaded": len(records),
+        "records_after_dedupe": len(kept),
+        "records_dropped_dupe": len(dropped),
+        "chunks": len(chunks),
+        "chunk_size_min": sizes[0],
+        "chunk_size_median": sizes[len(sizes) // 2],
+        "chunk_size_max": sizes[-1],
+        "postman_entries": len(postman_entries),
+        "embedder_backend": embedder.backend,
+        "embedder_model": embedder.model_name,
+        "embedder_device": embedder.device,
     }
-
-    with open(f"{vector_store_path}/stats.json", 'w') as f:
+    with (VECTOR_STORE_PATH / "stats.json").open("w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2)
 
-    console.print(f"\n[bold green]✓ Vector store created successfully at '{vector_store_path}'[/bold green]")
-    console.print("\nStatistics:")
-    console.print(f"  • CSV documents: {stats['csv_documents']}")
-    console.print(f"  • Context7 documents: {stats['context7_documents']}")
-    console.print(f"  • Postman endpoints: {stats['postman_endpoints']}")
-    console.print(f"  • Total chunks: {len(all_documents)}")
-
-    return True
+    console.rule("[bold green]Build complete[/bold green]")
+    for k, v in stats.items():
+        console.print(f"  {k}: {v}")
+    return 0
 
 
 if __name__ == "__main__":
-    create_optimized_vector_store()
+    raise SystemExit(main())
