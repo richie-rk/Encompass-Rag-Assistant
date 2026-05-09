@@ -1,204 +1,181 @@
-import json
-from typing import Dict, List, Any, Optional
-from pathlib import Path
-from langchain.chains.retrieval_qa.base import RetrievalQA
-from langchain.prompts import PromptTemplate
-from langchain_ollama import OllamaLLM
-from langchain_google_genai import GoogleGenerativeAI
-from langchain.schema import BaseRetriever, Document
-from langchain.callbacks.manager import CallbackManagerForRetrieverRun
-from rag_docs.retriever import HybridRetriever
+"""APIDocumentationRAG — orchestrates retrieval + LLM for one query.
+
+Pipeline:
+    HybridRetriever.retrieve(query) -> chunks + endpoints
+    _format_prompt(query, chunks, endpoints) -> single string
+    self.llm.invoke(prompt) -> answer string
+
+The previous implementation wrapped a HybridRetriever in a `CustomRetriever`
+and ran it through LangChain's `RetrievalQA`. RetrievalQA stuffs all retrieved
+documents into one `{context}` blob — that's a poor fit now that we have two
+distinct prompt sections (`## Documentation` and `## Relevant API endpoint(s)`)
+and the endpoints slot is conditional. We build the prompt directly here.
+"""
+from __future__ import annotations
+
+import os
+from typing import Any, Dict, List, Optional
+
+from rag_docs.retriever import ChunkHit, EndpointHit, HybridRetriever, RetrievalResult
 from rag_docs.utils.logger import logger
 
 
-class CustomRetriever(BaseRetriever):
-    """Custom retriever that wraps our HybridRetriever to be LangChain compatible"""
+DEFAULT_OLLAMA_MODEL = "qwen2.5-coder:7b"
 
-    hybrid_retriever: HybridRetriever
+SYSTEM_PROMPT = """You are an assistant for the Encompass Developer Connect API. \
+Answer the user's question using only the documentation excerpts and (when present) \
+the API endpoint metadata below. If the answer isn't in the provided context, say so \
+plainly — do not invent fields, parameters, or endpoints.
 
-    class Config:
-        arbitrary_types_allowed = True
-
-    def _get_relevant_documents(
-            self,
-            query: str,
-            *,
-            run_manager: Optional[CallbackManagerForRetrieverRun] = None
-    ) -> List[Document]:
-        """Synchronous retrieval method"""
-        return self.hybrid_retriever.hybrid_search(query, k=5)
-
-    async def _aget_relevant_documents(
-            self,
-            query: str,
-            *,
-            run_manager: Optional[CallbackManagerForRetrieverRun] = None
-    ) -> List[Document]:
-        """Asynchronous retrieval method"""
-        return self._get_relevant_documents(query, run_manager=run_manager)
+When you reference specific information, cite it as [Source N] using the numbered \
+sources below. When the user is asking how to call an API, point them at the \
+endpoints listed under "Relevant API endpoint(s)" if any are present.
+"""
 
 
 class APIDocumentationRAG:
-    def __init__(self, vector_store_path: str = "vector_store",
-                 model_name: str = "deepseek-coder-v2:16b",
-                 use_gemini: bool = False,
-                 gemini_api_key: Optional[str] = None):
-
+    def __init__(
+        self,
+        vector_store_path: str = "vector_store",
+        model_name: Optional[str] = None,
+        use_gemini: bool = False,
+        gemini_api_key: Optional[str] = None,
+    ):
         self.vector_store_path = vector_store_path
-        self.model_name = model_name
+        self.model_name = model_name or os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
         self.use_gemini = use_gemini
         self.gemini_api_key = gemini_api_key
 
-        # Initialize components
-        self.retriever = None
+        self.retriever: HybridRetriever | None = None
         self.llm = None
-        self.qa_chain = None
 
-        # Load vector store
-        self.load_vector_store()
+        self._load()
 
-    def load_vector_store(self):
-        """Load the vector store and setup retriever"""
+    # ----- Setup --------------------------------------------------------------
+
+    def _load(self) -> None:
         try:
-            # Initialize hybrid retriever
             self.retriever = HybridRetriever(self.vector_store_path)
             logger.info(f"Vector store loaded from {self.vector_store_path}")
-
-            # Setup LLM
-            self.setup_llm()
-
-            # Create QA chain
-            self.create_rag_pipeline()
-
-            return True
+            self._setup_llm()
         except Exception as e:
-            logger.error(f"Error loading vector store: {str(e)}")
+            logger.error(f"Error loading RAG system: {e}")
             raise
 
-    def setup_llm(self):
-        """Setup LLM based on configuration"""
+    def _setup_llm(self) -> None:
+        # Lazy imports — users who only use one provider don't pay the cost
+        # of installing the other's langchain integration package.
+        temperature = float(os.getenv("TEMPERATURE", "0.1"))
         if self.use_gemini and self.gemini_api_key:
+            from langchain_google_genai import GoogleGenerativeAI
             self.llm = GoogleGenerativeAI(
                 model="gemini-1.5-flash",
                 google_api_key=self.gemini_api_key,
-                temperature=0.1
+                temperature=temperature,
             )
-            logger.info("Using Gemini API for LLM")
+            logger.info("LLM provider: Gemini")
         else:
-            self.llm = OllamaLLM(
-                model=self.model_name,
-                temperature=0.1
-            )
-            logger.info(f"Using Ollama model: {self.model_name}")
+            from langchain_ollama import OllamaLLM
+            self.llm = OllamaLLM(model=self.model_name, temperature=temperature)
+            logger.info(f"LLM provider: Ollama ({self.model_name})")
 
-    def create_rag_pipeline(self):
-        """Create the RAG pipeline with enhanced prompt"""
-        prompt_template = """You are an expert on the Encompass API, helping developers with implementation and troubleshooting.
+    # ----- Prompt formatting --------------------------------------------------
 
-CONTEXT FROM DOCUMENTATION:
-{context}
-
-USER QUESTION: {question}
-
-INSTRUCTIONS:
-1. Provide a direct, accurate answer based on the documentation
-2. If discussing an API endpoint, include:
-   - HTTP method and path
-   - Required parameters
-   - Authentication requirements
-   - Example request/response if available
-3. For error troubleshooting, explain:
-   - Common causes
-   - How to fix the issue
-   - What to check in the request
-4. Include code examples when helpful
-5. Clearly indicate if information comes from official docs, CSV documentation, or Postman examples
-
-ANSWER:"""
-
-        PROMPT = PromptTemplate(
-            template=prompt_template,
-            input_variables=["context", "question"]
+    @staticmethod
+    def _format_chunk(idx: int, c: ChunkHit) -> str:
+        title = c.metadata.get("title", "") or "(untitled)"
+        breadcrumb = " > ".join(b for b in (c.metadata.get("breadcrumb") or []) if b) or "Documentation"
+        url = c.metadata.get("url", "")
+        return (
+            f"[Source {idx}] Title: {title}  •  Section: {breadcrumb}\n"
+            f"URL: {url}\n\n"
+            f"{c.page_content.strip()}"
         )
 
-        # Create a proper LangChain retriever that wraps our hybrid retriever
-        custom_retriever = CustomRetriever(hybrid_retriever=self.retriever)
+    @staticmethod
+    def _format_endpoint(e: EndpointHit) -> str:
+        ent = e.entry
+        folder = " > ".join(ent.folder_path) if ent.folder_path else ""
+        head = f"- {ent.method} {ent.url} — {ent.name}"
+        body_lines: List[str] = []
+        if folder:
+            body_lines.append(f"  Folder: {folder}")
+        if ent.description:
+            # Keep description tight in the prompt; full text stays in the response model.
+            body_lines.append(f"  {ent.description.strip().splitlines()[0][:200]}")
+        return "\n".join([head, *body_lines])
 
-        self.qa_chain = RetrievalQA.from_chain_type(
-            llm=self.llm,
-            chain_type="stuff",
-            retriever=custom_retriever,
-            chain_type_kwargs={"prompt": PROMPT},
-            return_source_documents=True
-        )
+    @classmethod
+    def _format_prompt(cls, query: str, result: RetrievalResult) -> str:
+        sections: List[str] = [SYSTEM_PROMPT, ""]
 
-        logger.info("RAG pipeline created successfully")
+        sections.append("## Documentation")
+        if not result.chunks:
+            sections.append("(no documentation matched this query)")
+        else:
+            for i, c in enumerate(result.chunks, start=1):
+                sections.append(cls._format_chunk(i, c))
+                sections.append("---")
+            # Drop the trailing separator
+            if sections[-1] == "---":
+                sections.pop()
 
-    def query(self, question: str) -> Dict[str, Any]:
-        """Query with enhanced source attribution"""
-        if not self.qa_chain:
+        if result.endpoints:
+            sections.append("")
+            sections.append("## Relevant API endpoint(s)")
+            for e in result.endpoints:
+                sections.append(cls._format_endpoint(e))
+
+        sections.append("")
+        sections.append("## Question")
+        sections.append(query.strip())
+        sections.append("")
+        sections.append("## Answer")
+        return "\n".join(sections)
+
+    # ----- Query --------------------------------------------------------------
+
+    def query(self, question: str, k: int = 5) -> Dict[str, Any]:
+        if not self.retriever or not self.llm:
             raise RuntimeError("RAG system not initialized")
 
-        logger.info(f"Processing query: {question}")
-
-        # Get answer and sources
-        result = self.qa_chain.invoke({"query": question})
-
-        # Process sources for better presentation
-        processed_sources = self._process_sources(result.get("source_documents", []))
+        logger.info(f"Query: {question}")
+        result = self.retriever.retrieve(question, k=k)
+        prompt = self._format_prompt(question, result)
+        answer = self.llm.invoke(prompt)
+        # OllamaLLM returns str; GoogleGenerativeAI returns str too — keep it strict.
+        if not isinstance(answer, str):
+            answer = str(answer)
 
         return {
-            "result": result["result"],
-            "source_documents": result.get("source_documents", []),
-            "context7_sources": processed_sources["context7"],
-            "postman_sources": processed_sources["postman"],
-            "csv_sources": processed_sources["csv_docs"]
+            "answer": answer,
+            "sources": [self._chunk_to_source(c) for c in result.chunks],
+            "relevant_endpoints": [self._endpoint_to_dict(e) for e in result.endpoints],
         }
 
-    def _process_sources(self, documents: List) -> Dict[str, List]:
-        """Process and categorize source documents"""
-        context7_sources = []
-        postman_sources = []
-        csv_sources = []
+    # ----- Serialization for the API layer -----------------------------------
 
-        for doc in documents:
-            metadata = doc.metadata
-
-            if metadata.get('source') == 'context7':
-                context7_sources.append({
-                    'content': doc.page_content[:500],  # Preview
-                    'url': metadata.get('url', ''),
-                    'type': metadata.get('type', ''),
-                    'full_content': doc.page_content
-                })
-            elif metadata.get('source') == 'csv_docs':
-                csv_sources.append({
-                    'content': doc.page_content[:500],  # Preview
-                    'url': metadata.get('url', ''),
-                    'title': metadata.get('title', ''),
-                    'type': metadata.get('type', ''),
-                    'full_content': doc.page_content
-                })
-            elif metadata.get('source') == 'postman':
-                # Parse the raw endpoint data if available
-                raw_data = {}
-                if metadata.get('raw_data'):
-                    try:
-                        raw_data = json.loads(metadata['raw_data'])
-                    except:
-                        pass
-
-                postman_sources.append({
-                    'content': doc.page_content[:500],
-                    'endpoint_name': metadata.get('endpoint_name', ''),
-                    'method': metadata.get('method', ''),
-                    'path': metadata.get('path', ''),
-                    'raw_data': raw_data,
-                    'full_content': doc.page_content
-                })
-
+    @staticmethod
+    def _chunk_to_source(c: ChunkHit) -> Dict[str, Any]:
+        m = c.metadata
+        full = c.page_content
         return {
-            'context7': context7_sources,
-            'postman': postman_sources,
-            'csv_docs': csv_sources
+            "title": m.get("title", ""),
+            "url": m.get("url", ""),
+            "kind": m.get("kind", ""),
+            "breadcrumb": list(m.get("breadcrumb") or []),
+            "preview": full[:500],
+            "full_content": full,
+            "score": float(c.score),
+        }
+
+    @staticmethod
+    def _endpoint_to_dict(e: EndpointHit) -> Dict[str, Any]:
+        ent = e.entry
+        return {
+            "name": ent.name,
+            "method": ent.method,
+            "path": ent.url,
+            "description": (ent.description or "").strip(),
+            "folder_path": list(ent.folder_path or []),
         }
