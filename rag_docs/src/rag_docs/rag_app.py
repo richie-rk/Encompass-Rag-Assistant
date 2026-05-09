@@ -6,6 +6,7 @@ from typing import List, Optional
 import uvicorn
 import os
 from dotenv import load_dotenv
+from huggingface_hub import snapshot_download
 
 from rag_docs.rag_class import APIDocumentationRAG
 from rag_docs.utils.logger import logger
@@ -53,15 +54,43 @@ class QueryResponse(BaseModel):
 
 # --- Lifespan / app ----------------------------------------------------------
 
+def _resolve_vector_store_path() -> str:
+    """Resolve the directory holding the FAISS + BM25 + chunk artifacts.
+
+    Order:
+        1. ``VECTOR_STORE_PATH`` env var — must point at an existing directory.
+        2. ``./vector_store/`` if it exists (local build wins over remote).
+        3. ``snapshot_download`` from HF — lands in the HF cache, returns that path.
+    """
+    explicit = os.getenv("VECTOR_STORE_PATH")
+    if explicit:
+        if not os.path.isdir(explicit):
+            raise RuntimeError(
+                f"VECTOR_STORE_PATH={explicit!r} is set but is not an existing directory."
+            )
+        return explicit
+
+    if os.path.isdir("vector_store"):
+        return "vector_store"
+
+    repo_id = os.getenv("VECTOR_STORE_HF_REPO", "Richie-rk/encompass-developer-connect-index")
+    revision = os.getenv("VECTOR_STORE_HF_REVISION", "main")
+    logger.info(f"No local vector store found; fetching {repo_id}@{revision} from HF")
+    try:
+        return snapshot_download(repo_id=repo_id, repo_type="dataset", revision=revision)
+    except Exception as e:
+        raise RuntimeError(
+            f"Vector store not available: no local copy and HF fetch failed ({e}). "
+            "Either: (1) build locally with `python -m scripts.create_vector_store`, "
+            "(2) ensure network access and HF auth (set HF_TOKEN if the dataset is private), "
+            "or (3) set VECTOR_STORE_PATH to an existing directory."
+        ) from e
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize the RAG system on startup."""
-    vector_store_path = os.getenv("VECTOR_STORE_PATH", "vector_store")
-
-    if not os.path.exists(vector_store_path):
-        logger.error(f"Vector store not found at {vector_store_path}")
-        logger.error("Run `python -m scripts.create_vector_store` from the repo root first.")
-        raise RuntimeError(f"Vector store not found at {vector_store_path}")
+    vector_store_path = _resolve_vector_store_path()
 
     use_gemini = os.getenv("USE_GEMINI", "false").lower() == "true"
     gemini_api_key = os.getenv("GEMINI_API_KEY", None)

@@ -3,6 +3,8 @@
 
 A sophisticated Retrieval-Augmented Generation (RAG) system for querying Encompass API documentation with natural language, featuring hybrid retrieval and multiple LLM support.
 
+> **Unofficial.** Not affiliated with ICE Mortgage Technology. A community-built retrieval index and RAG pipeline over the publicly available Encompass Developer Connect documentation, intended as a developer reference and for educational/research use. For canonical, up-to-date documentation, always defer to the official source: <https://developer.icemortgagetechnology.com/>.
+
 ## Table of Contents
 - [Overview](#overview)
 - [Features](#features)
@@ -189,6 +191,14 @@ The system features a sophisticated multi-component architecture:
    ```bash
    python scripts/create_vector_store.py
    ```
+
+   > **💡 Skip steps 6–7 if you just want to run the API.** If `./vector_store/`
+   > is missing on first boot, the API automatically fetches the published index
+   > from Hugging Face into the HF cache (`~/.cache/huggingface/hub/...`) and uses
+   > it. Configurable via `VECTOR_STORE_HF_REPO` and `VECTOR_STORE_HF_REVISION` in
+   > `.env` (defaults point at
+   > [`Richie-rk/encompass-developer-connect-index`](https://huggingface.co/datasets/Richie-rk/encompass-developer-connect-index)
+   > on `main`). Build locally only when you want to re-ingest your own crawl.
 
 ## Usage
 
