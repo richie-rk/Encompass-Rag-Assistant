@@ -2,7 +2,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Dataset: 🤗 Hugging Face](https://img.shields.io/badge/Dataset-%F0%9F%A4%97%20Hugging%20Face-yellow.svg)](https://huggingface.co/datasets/Richie-rk/encompass-developer-connect-index)
 
-A sophisticated Retrieval-Augmented Generation (RAG) system for querying Encompass API documentation with natural language, featuring hybrid retrieval and multiple LLM support.
+A Retrieval-Augmented Generation (RAG) system for querying Encompass API documentation with natural language, featuring hybrid retrieval and multiple LLM support.
 
 > **Unofficial.** Not affiliated with ICE Mortgage Technology. A community-built retrieval index and RAG pipeline over the publicly available Encompass Developer Connect documentation, intended as a developer reference and for educational/research use. For canonical, up-to-date documentation, always defer to the official source: <https://developer.icemortgagetechnology.com/>.
 
@@ -16,17 +16,17 @@ A sophisticated Retrieval-Augmented Generation (RAG) system for querying Encompa
 
 ## Overview
 
-The Encompass RAG Assistant is an advanced tool that allows users to query Encompass API documentation using natural language. It leverages a hybrid retrieval system combining semantic and keyword search across 3000+ Encompass URLs, Postman collections, and Context7 documentation to provide accurate, contextual answers to API-related questions.
+The Encompass RAG Assistant is a tool that allows users to query Encompass API documentation using natural language. It leverages a hybrid retrieval system combining semantic and keyword search over the publicly available Encompass Developer Connect documentation and the Postman collection to provide contextual answers to API-related questions.
 
 This application combines cutting-edge RAG techniques with a user-friendly interface to make Encompass API documentation more accessible and easier to navigate.
 
 ## Features
 
-- **Hybrid Retrieval System**: Combines FAISS semantic search with BM25 keyword search for superior accuracy
-- **Multi-LLM Support**: Choose between Ollama (qwen2.5-coder:7b) and Google Gemini models
-- **Advanced Embeddings**: Uses BAAI/bge-base-en-v1.5 for superior semantic understanding
-- **Categorized Sources**: Responses include categorized sources (Context7, Postman, CSV documentation)
-- **Multiple Data Sources**: Integrates Context7 LLM data, Postman collections, and CSV documentation
+- **Hybrid Retrieval System**: Combines FAISS semantic search with BM25 keyword search, fused via Reciprocal Rank Fusion (RRF)
+- **Multi-LLM Support**: Choose between Ollama (qwen2.5-coder:7b) and Google Gemini (gemini-1.5-flash)
+- **Jina v3 Embeddings**: `jinaai/jina-embeddings-v3` (1024-d) with task-specific prompts for retrieval
+- **Postman Endpoint Gate**: Token-overlap + score-ratio gate surfaces 0–3 relevant API endpoints separately from prose chunks
+- **Two Data Sources**: Crawled Encompass Developer Connect documentation + Postman collection
 - **Environment Configuration**: Full .env support for easy deployment and configuration
 - **Enhanced FastAPI Backend**: Robust API with health checks, configuration endpoints, and CORS support
 - **Streamlit UI**: Clean, intuitive interface with enhanced source display
@@ -34,23 +34,23 @@ This application combines cutting-edge RAG techniques with a user-friendly inter
 
 ## Architecture
 
-The system features a sophisticated multi-component architecture:
+The system has a multi-component architecture:
 
 ###  **Data Processing & Storage**
-- **BAAI/bge-base-en-v1.5 Embeddings**: State-of-the-art semantic embeddings
-- **FAISS Vector Store**: High-performance semantic similarity search
-- **BM25 Index**: Traditional keyword-based search for exact matches
-- **Metadata Store**: Comprehensive source attribution and tracking
+- **Jina v3 Embeddings**: `jinaai/jina-embeddings-v3` (1024-d); `task=retrieval.passage` at ingest, `retrieval.query` at query time
+- **FAISS-IP Vector Store**: Inner-product similarity search over Jina vectors
+- **BM25 Index**: `rank_bm25.BM25Okapi` over the same chunks for lexical matching
+- **Metadata Store**: Per-chunk title, breadcrumb, kind, and source URL
 
 ### **Hybrid Retrieval System**
-- **HybridRetriever**: Intelligent combination of semantic and keyword search
-- **Weighted Fusion**: Configurable alpha parameter (default 0.6) for search balance
-- **Score Normalization**: Advanced scoring system for optimal result ranking
+- **HybridRetriever**: FAISS semantic + BM25 lexical over the prose chunk corpus
+- **RRF Fusion**: Reciprocal Rank Fusion (`k=60`) merges semantic and lexical rankings into one top-k list
+- **Postman Endpoint Gate**: Separate BM25 over Postman entries → token-overlap filter (≥0.3) → score-ratio split returns 0–3 endpoints
 
 ### **LLM Integration**
 - **Ollama Support**: Local LLM hosting with qwen2.5-coder:7b
 - **Google Gemini**: Cloud-based gemini-1.5-flash model option
-- **LangChain Integration**: Standardized LLM interface with RetrievalQA chains
+- **Direct Prompt Construction**: `## Documentation` and `## Relevant API endpoint(s)` are built as separate prompt sections (no RetrievalQA chain)
 
 ### **API & Interface**
 - **FastAPI Backend**: Production-ready API with comprehensive endpoints
@@ -58,7 +58,40 @@ The system features a sophisticated multi-component architecture:
 - **Streamlit UI**: Enhanced interface with categorized source display
 - **CORS Support**: Ready for web application integration
 
-![Flowchart of the process](Flowchart.png)
+```mermaid
+flowchart TD
+    subgraph Ingest["Build pipeline (offline)"]
+        direction TB
+        Crawler["scripts/crawler/<br/>(skips auth-gated)"] --> JSONL["developer_connect.jsonl"]
+        JSONL --> FDC["filter → dedupe → chunk<br/>page-wise ≤ 2K, else 1500/200"]
+        FDC --> Embed["Jina v3 embed<br/>task=retrieval.passage"]
+        Postman["Encompass_Developer_Connect_<br/>postman_collection.json"]
+    end
+
+    Embed --> FAISS[("FAISS-IP<br/>jsonl_faiss/")]
+    Embed --> BM25C[("BM25 over chunks<br/>jsonl_bm25.pkl")]
+    Postman --> PEntries[("Postman BM25 + entries<br/>postman_*.pkl")]
+
+    HF[("HF dataset (fallback)<br/>Richie-rk/encompass-developer-connect-index")] -. "snapshot_download<br/>if local missing" .-> FAISS
+
+    subgraph Runtime["Query pipeline (runtime)"]
+        direction TB
+        Q["User query"] --> QE["Embed via Jina v3<br/>task=retrieval.query"]
+        QE --> Sem["FAISS top-N"]
+        Q --> Lex["BM25 top-N over chunks"]
+        Sem --> RRF["RRF fuse → top-K chunks"]
+        Lex --> RRF
+        Q --> PG["Postman BM25 +<br/>token-overlap gate"]
+        RRF --> Prompt["Prompt builder<br/>## Documentation + ## Endpoints"]
+        PG --> Prompt
+        Prompt --> LLM["LLM<br/>Ollama qwen2.5-coder · Gemini 1.5 Flash"]
+        LLM --> Ans["Answer + sources + endpoints"]
+    end
+
+    FAISS --> Sem
+    BM25C --> Lex
+    PEntries --> PG
+```
 
 ## Installation
 
