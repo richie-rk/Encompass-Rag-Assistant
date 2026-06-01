@@ -1,69 +1,65 @@
+<div align="center">
+
 # Encompass RAG Assistant
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Dataset: 🤗 Hugging Face](https://img.shields.io/badge/Dataset-%F0%9F%A4%97%20Hugging%20Face-yellow.svg)](https://huggingface.co/datasets/Richie-rk/encompass-developer-connect-index)
 
-A Retrieval-Augmented Generation (RAG) system for querying Encompass API documentation with natural language, featuring hybrid retrieval and multiple LLM support.
+A Retrieval-Augmented Generation (RAG) system for querying Encompass API documentation in plain English, with hybrid retrieval and support for more than one LLM.
 
-> **Unofficial.** Not affiliated with ICE Mortgage Technology. A community-built retrieval index and RAG pipeline over the publicly available Encompass Developer Connect documentation, intended as a developer reference and for educational/research use. For canonical, up-to-date documentation, always defer to the official source: <https://developer.icemortgagetechnology.com/>.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT) [![Dataset: 🤗 Hugging Face](https://img.shields.io/badge/Dataset-%F0%9F%A4%97%20Hugging%20Face-yellow.svg)](https://huggingface.co/datasets/Richie-rk/encompass-developer-connect-index)
+
+</div>
+
+> **Unofficial.** Not affiliated with ICE Mortgage Technology. This is a community-built retrieval index and RAG pipeline over the publicly available Encompass Developer Connect documentation, meant as a developer reference and for educational and research use. For canonical, up-to-date documentation, always defer to the official source: <https://developer.icemortgagetechnology.com/>.
+
+## Why I built this
+
+I worked for a mortgage client whose loan origination system used Encompass from ICE Mortgage as its data source, so I was constantly digging through the Encompass documentation. General tools like Perplexity and ChatGPT do a decent job of answering questions about it, but they trip up on the niche endpoints and they have no access to the Postman collection at all. I built this RAG assistant to fix that, so I could ask questions against the real docs and the Postman collection together and get answers that actually point at the right endpoints.
 
 ## Table of Contents
+
 - [Overview](#overview)
 - [Features](#features)
 - [Architecture](#architecture)
 - [Installation](#installation)
 - [Usage](#usage)
 - [Configuration](#configuration)
+- [Contributing](#contributing)
 
 ## Overview
 
-The Encompass RAG Assistant is a tool that allows users to query Encompass API documentation using natural language. It leverages a hybrid retrieval system combining semantic and keyword search over the publicly available Encompass Developer Connect documentation and the Postman collection to provide contextual answers to API-related questions.
+The Encompass RAG Assistant lets you query the Encompass API documentation using natural language. It runs a hybrid retrieval system that combines semantic and keyword search over the publicly available Encompass Developer Connect documentation and the Postman collection, then uses that context to answer your API questions.
 
-This application combines cutting-edge RAG techniques with a user-friendly interface to make Encompass API documentation more accessible and easier to navigate.
+The aim is simple: make the Encompass docs easier to search and easier to trust, especially for the endpoints the general-purpose chatbots tend to get wrong.
 
 ## Features
 
-- **Hybrid Retrieval System**: Combines FAISS semantic search with BM25 keyword search, fused via Reciprocal Rank Fusion (RRF)
-- **Multi-LLM Support**: Choose between Ollama (qwen2.5-coder:7b) and Google Gemini (gemini-1.5-flash)
-- **Jina v3 Embeddings**: `jinaai/jina-embeddings-v3` (1024-d) with task-specific prompts for retrieval
-- **Postman Endpoint Gate**: Token-overlap + score-ratio gate surfaces 0–3 relevant API endpoints separately from prose chunks
-- **Two Data Sources**: Crawled Encompass Developer Connect documentation + Postman collection
-- **Environment Configuration**: Full .env support for easy deployment and configuration
-- **Enhanced FastAPI Backend**: Robust API with health checks, configuration endpoints, and CORS support
-- **Streamlit UI**: Clean, intuitive interface with enhanced source display
-- **Source Attribution**: Detailed source tracking with metadata and full content access
+- Hybrid retrieval that combines FAISS semantic search with BM25 keyword search, fused via Reciprocal Rank Fusion (RRF)
+- Support for more than one LLM, so you can choose between Ollama (qwen2.5-coder:7b) and Google Gemini (gemini-1.5-flash)
+- Jina v3 embeddings (`jinaai/jina-embeddings-v3`, 1024-d) with task-specific prompts for retrieval
+- A Postman endpoint gate that uses token-overlap and a score-ratio split to surface 0 to 3 relevant API endpoints separately from the prose chunks
+- Two data sources: the crawled Developer Connect documentation and the Postman collection
+- Full `.env` configuration for easy deployment
+- A FastAPI backend with health checks, configuration endpoints, and CORS support
+- A clean Streamlit UI with source display
+- Source attribution, with metadata and full content access on each result
 
 ## Architecture
 
-The system has a multi-component architecture:
+The system is built in a few clear layers.
 
-###  **Data Processing & Storage**
-- **Jina v3 Embeddings**: `jinaai/jina-embeddings-v3` (1024-d); `task=retrieval.passage` at ingest, `retrieval.query` at query time
-- **FAISS-IP Vector Store**: Inner-product similarity search over Jina vectors
-- **BM25 Index**: `rank_bm25.BM25Okapi` over the same chunks for lexical matching
-- **Metadata Store**: Per-chunk title, breadcrumb, kind, and source URL
+**Data processing and storage.** Jina v3 produces 1024-d embeddings (`task=retrieval.passage` at ingest, `retrieval.query` at query time). Those vectors go into a FAISS inner-product store, and a `rank_bm25.BM25Okapi` index covers the same chunks for lexical matching. A metadata store keeps each chunk's title, breadcrumb, kind, and source URL.
 
-### **Hybrid Retrieval System**
-- **HybridRetriever**: FAISS semantic + BM25 lexical over the prose chunk corpus
-- **RRF Fusion**: Reciprocal Rank Fusion (`k=60`) merges semantic and lexical rankings into one top-k list
-- **Postman Endpoint Gate**: Separate BM25 over Postman entries → token-overlap filter (≥0.3) → score-ratio split returns 0–3 endpoints
+**Hybrid retrieval.** A `HybridRetriever` runs FAISS semantic search and BM25 lexical search over the prose corpus, then RRF (`k=60`) merges the two rankings into one top-k list. A separate BM25 over the Postman entries, followed by a token-overlap filter (>= 0.3) and a score-ratio split, returns 0 to 3 endpoints.
 
-### **LLM Integration**
-- **Ollama Support**: Local LLM hosting with qwen2.5-coder:7b
-- **Google Gemini**: Cloud-based gemini-1.5-flash model option
-- **Direct Prompt Construction**: `## Documentation` and `## Relevant API endpoint(s)` are built as separate prompt sections (no RetrievalQA chain)
+**LLM integration.** You can run a local model through Ollama (qwen2.5-coder:7b) or call Google Gemini (gemini-1.5-flash). Prompts are built directly, with `## Documentation` and `## Relevant API endpoint(s)` as separate sections rather than going through a RetrievalQA chain.
 
-### **API & Interface**
-- **FastAPI Backend**: Production-ready API with comprehensive endpoints
-- **Environment Configuration**: Full .env support for deployment flexibility
-- **Streamlit UI**: Enhanced interface with categorized source display
-- **CORS Support**: Ready for web application integration
+**API and interface.** A FastAPI backend exposes the query and status endpoints with CORS support, and a Streamlit UI sits on top with categorized source display.
 
 ```mermaid
 flowchart TD
     subgraph Ingest["Build pipeline (offline)"]
         direction TB
         Crawler["scripts/crawler/<br/>(skips auth-gated)"] --> JSONL["developer_connect.jsonl"]
-        JSONL --> FDC["filter → dedupe → chunk<br/>page-wise ≤ 2K, else 1500/200"]
+        JSONL --> FDC["filter, dedupe, chunk<br/>page-wise <= 2K, else 1500/200"]
         FDC --> Embed["Jina v3 embed<br/>task=retrieval.passage"]
         Postman["Encompass_Developer_Connect_<br/>postman_collection.json"]
     end
@@ -79,12 +75,12 @@ flowchart TD
         Q["User query"] --> QE["Embed via Jina v3<br/>task=retrieval.query"]
         QE --> Sem["FAISS top-N"]
         Q --> Lex["BM25 top-N over chunks"]
-        Sem --> RRF["RRF fuse → top-K chunks"]
+        Sem --> RRF["RRF fuse, top-K chunks"]
         Lex --> RRF
         Q --> PG["Postman BM25 +<br/>token-overlap gate"]
         RRF --> Prompt["Prompt builder<br/>## Documentation + ## Endpoints"]
         PG --> Prompt
-        Prompt --> LLM["LLM<br/>Ollama qwen2.5-coder · Gemini 1.5 Flash"]
+        Prompt --> LLM["LLM<br/>Ollama qwen2.5-coder, Gemini 1.5 Flash"]
         LLM --> Ans["Answer + sources + endpoints"]
     end
 
@@ -96,185 +92,144 @@ flowchart TD
 ## Installation
 
 ### Prerequisites
-- Python 3.11+ (Python 3.13 compatible)
-- Ollama (for local LLM hosting) OR Google Gemini API key
-- CUDA-compatible GPU recommended for embeddings
-- 16GB+ RAM recommended for optimal performance
-- Optional: [uv](https://docs.astral.sh/uv/) for faster package installation
+
+- Python 3.11+ (works on 3.13)
+- Ollama for local LLM hosting, or a Google Gemini API key
+- A CUDA-compatible GPU recommended for embeddings
+- 16GB+ RAM recommended
+- Optional: [uv](https://docs.astral.sh/uv/) for faster installs
 
 ### Setup
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/richie-rk/encompass-rag-assistant.git
-   cd encompass-rag-assistant
-   ```
+Clone the repository:
 
-2. Create a virtual environment:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
+```bash
+git clone https://github.com/richie-rk/encompass-rag-assistant.git
+cd encompass-rag-assistant
+```
 
-3. **Install dependencies** — pick the path that matches your hardware. The
-   only thing that differs is which `torch` build gets installed; the
-   application code dispatches to CPU or GPU at runtime via `JINA_DEVICE`
-   in `.env`.
+Create a virtual environment:
 
-   **Option A — uv with pyproject.toml (recommended)**
+```bash
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+```
 
-   *CPU only* (works everywhere; embedding pipeline runs on CPU):
-   ```bash
-   uv pip install -e .
-   ```
+Install dependencies. The only thing that changes between the options is which `torch` build you get. The app picks CPU or GPU at runtime via `JINA_DEVICE` in `.env`.
 
-   *NVIDIA GPU (CUDA 12.1)* — pulls CUDA-enabled `torch` + `faiss-gpu`:
-   ```bash
-   uv pip install -e ".[gpu]"
-   ```
+With uv (recommended):
 
-   *With dev extras*:
-   ```bash
-   uv pip install -e ".[dev]"
-   uv pip install -e ".[dev,gpu]"   # GPU + dev tools
-   ```
+```bash
+uv pip install -e .              # CPU, works everywhere
+uv pip install -e ".[gpu]"       # NVIDIA GPU (CUDA 12.1), CUDA torch + faiss-gpu
+uv pip install -e ".[dev]"       # CPU + dev tools
+uv pip install -e ".[dev,gpu]"   # GPU + dev tools
+uv pip install -e ".[all]"       # everything
+```
 
-   *Everything*:
-   ```bash
-   uv pip install -e ".[all]"
-   ```
+With plain pip:
 
-   **Option B — plain pip (no uv)**
+```bash
+pip install -e .                 # CPU
+# or: pip install -r requirements.txt
+```
 
-   *CPU*:
-   ```bash
-   pip install -e .
-   # or:  pip install -r requirements.txt
-   ```
+For a GPU build with pip, torch needs the PyTorch index, so it's a two-step:
 
-   *NVIDIA GPU (CUDA 12.1)* — pip can't auto-route `torch` to the PyTorch
-   index from `pyproject.toml`, so the GPU build is a two-step:
-   ```bash
-   pip install -e .
-   pip uninstall -y torch
-   pip install torch --index-url https://download.pytorch.org/whl/cu121
-   pip install faiss-gpu>=1.7.4
-   ```
+```bash
+pip install -e .
+pip uninstall -y torch
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+pip install faiss-gpu>=1.7.4
+```
 
-   > **💡 Which method to choose?**
-   > - **uv (Option A)**: significantly faster installs; auto-routes `torch`
-   >   to the right index when you pick `[gpu]`. Recommended.
-   > - **pip (Option B)**: works without extra tooling; needs the manual
-   >   torch swap above for GPU.
-   >
-   > **💡 Hardware setup**
-   > After install, set `JINA_DEVICE=cuda` (or `mps` on Apple silicon) in
-   > `.env` to actually use the GPU at embedding time. Default is `cpu`.
+After install, set `JINA_DEVICE=cuda` (or `mps` on Apple silicon) in `.env` to actually use the GPU at embedding time. The default is `cpu`.
 
-4. **LLM Setup** (Choose one):
+### LLM setup
 
-   **Option A: Ollama (Local)**
-   ```bash
-   # Install Ollama from https://ollama.ai/
-   ollama pull qwen2.5-coder:7b
-   ```
+Pick one.
 
-   **Option B: Google Gemini (Cloud)**
-   ```bash
-   # Get API key from https://ai.google.dev/
-   # Set in .env file: GEMINI_API_KEY=your_key_here
-   ```
+Ollama (local):
 
-5. **Environment Configuration**:
-   ```bash
-   # Create .env file with your settings
-   cp .env.example .env
-   # Edit .env with your preferred configuration
-   ```
+```bash
+# Install Ollama from https://ollama.ai/
+ollama pull qwen2.5-coder:7b
+```
 
-6. **Crawl the Developer Connect documentation**:
-   ```bash
-   # From the repo root — fetches all guide / API-reference / changelog pages
-   # for /developer-connect/ and writes scripts/data/developer_connect.jsonl
-   python -m scripts.crawler
-   ```
+Google Gemini (cloud):
 
-   The crawler enumerates the page frontier from the ReadMe sidebar (no BFS) and
-   extracts each page's authored Markdown, OpenAPI spec, and metadata directly
-   from the embedded `ssr-props` JSON. First run takes ~5–7 minutes (216 pages
-   at 0.5 s delay); HTML is cached to `scripts/data/cache/`, so re-runs are
-   instant.
+```bash
+# Get an API key from https://ai.google.dev/
+# Set it in .env: GEMINI_API_KEY=your_key_here
+```
 
-   Useful flags:
-   ```bash
-   python -m scripts.crawler --dry-run              # enumerate frontier, no fetches
-   python -m scripts.crawler --limit 10             # debug: only first 10 pages
-   python -m scripts.crawler --no-cache             # ignore cache, refetch all
-   python -m scripts.crawler --include-hidden       # include hidden:true pages
-   python -m scripts.crawler --delay 1.0            # slower pace for politeness
-   python -m scripts.crawler --help                 # full option list
-   ```
+### Configuration file
 
-   Outputs:
-   - `scripts/data/developer_connect.jsonl` — one record per page (slug, title,
-     URL, breadcrumb, `body_md`, OpenAPI `oas`, `updated_at`, …)
-   - `scripts/data/developer_connect_manifest.jsonl` — per-URL fetch log with
-     status, cache-hit, body hash, and any error reason
+```bash
+cp .env.example .env
+# Edit .env with your settings
+```
 
-7. **Create the vector store**:
-   ```bash
-   python scripts/create_vector_store.py
-   ```
+### Build the index (optional)
 
-   > **💡 Skip steps 6–7 if you just want to run the API.** If `./vector_store/`
-   > is missing on first boot, the API automatically fetches the published index
-   > from Hugging Face into the HF cache (`~/.cache/huggingface/hub/...`) and uses
-   > it. Configurable via `VECTOR_STORE_HF_REPO` and `VECTOR_STORE_HF_REVISION` in
-   > `.env` (defaults point at
-   > [`Richie-rk/encompass-developer-connect-index`](https://huggingface.co/datasets/Richie-rk/encompass-developer-connect-index)
-   > on `main`). Build locally only when you want to re-ingest your own crawl.
+If you just want to run the API, you can skip this. When `./vector_store/` is missing on first boot, the API automatically pulls the published index from Hugging Face into the HF cache and uses it. This is controlled by `VECTOR_STORE_HF_REPO` and `VECTOR_STORE_HF_REVISION` in `.env`, which default to [`Richie-rk/encompass-developer-connect-index`](https://huggingface.co/datasets/Richie-rk/encompass-developer-connect-index) on `main`. Only build locally if you want to re-ingest your own crawl.
+
+To build it yourself, first crawl the docs:
+
+```bash
+# Fetches the guide, API-reference, and changelog pages for /developer-connect/
+# and writes scripts/data/developer_connect.jsonl
+python -m scripts.crawler
+```
+
+The crawler reads the page frontier from the ReadMe sidebar and pulls each page's Markdown, OpenAPI spec, and metadata from the embedded `ssr-props` JSON. The first run takes about 5 to 7 minutes (216 pages at a 0.5s delay), and HTML is cached to `scripts/data/cache/` so re-runs are fast. Run `python -m scripts.crawler --help` for the full set of flags (`--dry-run`, `--limit`, `--no-cache`, and so on).
+
+Then create the vector store:
+
+```bash
+python scripts/create_vector_store.py
+```
 
 ## Usage
 
-### **Quick Start**
+Start the FastAPI backend:
 
-1. **Start the FastAPI backend**:
-   ```bash
-   cd rag_docs/src
-   python -m rag_docs.rag_app
-   ```
+```bash
+cd rag_docs/src
+python -m rag_docs.rag_app
+```
 
-2. **In a separate terminal, start the Streamlit UI**:
-   ```bash
-   cd rag_docs/src
-   streamlit run rag_docs/web_ui.py
-   ```
+In a separate terminal, start the Streamlit UI:
 
-3. **Access the application**:
-   - **Streamlit UI**: http://localhost:8501
-   - **FastAPI docs**: http://localhost:8000/docs
-   - **Health check**: http://localhost:8000/api/health
+```bash
+cd rag_docs/src
+streamlit run rag_docs/web_ui.py
+```
 
-### **API Endpoints**
+Then open:
 
-- `POST /api/query` - Submit questions about Encompass API
-- `GET /api/health` - Check system status
-- `GET /api/config` - View current configuration
+- Streamlit UI: <http://localhost:8501>
+- FastAPI docs: <http://localhost:8000/docs>
+- Health check: <http://localhost:8000/api/health>
+
+### API endpoints
+
+- `POST /api/query` submits a question about the Encompass API
+- `GET /api/health` checks system status
+- `GET /api/config` shows the current configuration
 
 ## Configuration
 
-The application is fully configurable through environment variables or a `.env` file:
-
-### **Environment Variables**
+Everything is configurable through environment variables or a `.env` file.
 
 ```bash
-# LLM Configuration
+# LLM
 OLLAMA_MODEL=qwen2.5-coder:7b
 USE_GEMINI=false
 GEMINI_API_KEY=your_gemini_api_key_here
 TEMPERATURE=0.1
 
-# Vector Store Configuration
+# Vector store
 VECTOR_STORE_PATH=vector_store
 
 # Embeddings (Jina v3)
@@ -283,51 +238,35 @@ JINA_API_KEY=                   # required when JINA_BACKEND=api
 JINA_MODEL=jinaai/jina-embeddings-v3
 JINA_DEVICE=cpu                 # `cpu`, `cuda`, or `mps`
 
-# API Configuration
-HOST=0.0.0.0
-PORT=8000
-
-# Logging Configuration
-LOG_LEVEL=INFO
-LOG_FORMAT=%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s
-LOG_FILE=logs/app.log
-LOG_MAX_SIZE=10485760
-LOG_BACKUP_COUNT=5
-
-# Retrieval Configuration
-HYBRID_ALPHA=0.6  # Weight for semantic vs keyword search
-RETRIEVAL_K=5     # Number of documents to retrieve
-```
-
-### **Example .env File**
-
-```env
-# Choose your LLM provider
-USE_GEMINI=false
-OLLAMA_MODEL=qwen2.5-coder:7b
-# GEMINI_API_KEY=your_key_here
-
-# Vector store settings
-VECTOR_STORE_PATH=vector_store
-TEMPERATURE=0.1
-
-# API settings
+# API
 HOST=0.0.0.0
 PORT=8000
 
 # Logging
 LOG_LEVEL=INFO
+LOG_FILE=logs/app.log
+
+# Retrieval
+HYBRID_ALPHA=0.6  # weight for semantic vs keyword search
+RETRIEVAL_K=5     # number of documents to retrieve
 ```
 
-## Building the Package
+## Contributing
 
-```bash
-# Build wheel and source distribution
-python -m build
+Contributions are welcome, whether it's a bug fix, a new feature, or a better retrieval idea. Here's the flow I'd like you to follow.
 
-# Or with uv (faster)
-uv build
-```
+1. Fork the repository and clone your fork locally.
+2. Before you write any code, open an issue. If it's a bug, describe how to reproduce it. If it's a feature, explain what you want to add and why. This gives us a place to agree on the approach before any work happens.
+3. Create a branch for your change off `main`.
+4. Make your change, and update or add tests where it makes sense.
+5. Open a pull request and link it to the issue (for example, "Closes #12"), so the work and the issue stay tied together.
+
+If you're not sure whether something fits, open an issue and ask first. I'd rather talk it through early than have you spend time on something that's hard to merge.
+
+## License
+
+Distributed under the MIT License. See `LICENSE` for details.
+
 ---
 
-Built with ❤️ for Encompass API users
+Built to make the Encompass API documentation easier to search, for the developers who have to live in it.
